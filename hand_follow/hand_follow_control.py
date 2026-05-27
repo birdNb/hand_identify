@@ -153,6 +153,11 @@ class HandFollowController:
 
 
 class JoyMonitor:
+    """
+    监听物理手柄 /joy。有输入时 block 手势底盘/动作库；脸跟踪不受影响。
+  手柄松开后需空闲 idle_sec 才恢复手势控制。
+    """
+
     def __init__(
         self,
         topic: str = JOY_TOPIC,
@@ -163,6 +168,7 @@ class JoyMonitor:
         self._active_thresh = active_thresh
         self._idle_sec = idle_sec
         self._last_active_t = 0.0
+        self._was_blocking = False
         self._sub = rospy.Subscriber(topic, Joy, self._cb, queue_size=10)
 
     def _axis_active(self, idx: int, val: float) -> bool:
@@ -186,11 +192,29 @@ class JoyMonitor:
             with self._lock:
                 self._last_active_t = time.time()
 
+    def is_active_now(self) -> bool:
+        """当前是否检测到手柄输入（未等空闲计时）。"""
+        with self._lock:
+            if self._last_active_t <= 0:
+                return False
+            return (time.time() - self._last_active_t) < self._idle_sec
+
+    def blocks_gesture_control(self) -> bool:
+        """为 True 时手势跟手/动作库/手势1点头应让路给手柄。"""
+        return not self.allow_program_cmd()
+
     def allow_program_cmd(self) -> bool:
         with self._lock:
             if self._last_active_t <= 0:
                 return True
             return (time.time() - self._last_active_t) >= self._idle_sec
+
+    def poll_takeover_edge(self) -> bool:
+        """手柄刚接管控制时返回 True（上升沿，每轮循环调一次）。"""
+        blocking = self.blocks_gesture_control()
+        edge = blocking and not self._was_blocking
+        self._was_blocking = blocking
+        return edge
 
     def idle_remaining(self) -> float:
         with self._lock:
@@ -331,6 +355,15 @@ class NeckController(threading.Thread):
     def is_busy(self) -> bool:
         with self._lock:
             return self._phase in ("feedback", "return")
+
+    def abort_gesture_nod(self) -> bool:
+        """手柄接管等场景下中止手势1点头。"""
+        with self._lock:
+            if self._phase == "idle":
+                return False
+            self._phase = "idle"
+            self._goal_pitch = 0.0
+            return True
 
     def trigger_gesture_nod(
         self,

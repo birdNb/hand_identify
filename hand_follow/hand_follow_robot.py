@@ -5,6 +5,7 @@
 # 手势 0: 急停+中止动作；按住 5s 退出程序
 # 手势 1: 抬头 20° 后复原（期间暂停脸跟踪脖子输出）
 # 手势 2~4: 抬手 / 挥动双手 / 踢球（/joy_msg 动作库）
+# 手柄 /joy 有输入时：停手势跟手/动作库/点头，脸跟踪保持
 # 底盘: 误差 > 0.3m → 指令 ±0.3; 手静止不发指令
 # 脸部跟踪: 常开，与手势识别共用 ZED RGB
 
@@ -227,6 +228,16 @@ def main():
 
     prev_gesture = -1
     neck_nod_was_busy = False
+
+    def _release_gesture_control_to_joy():
+        """手柄接管：停动作库、停手势1点头、恢复脸跟踪控脖。"""
+        if action_player is not None and action_player.is_busy:
+            action_player.abort()
+        if neck_thread is not None and neck_thread.is_busy:
+            neck_thread.abort_gesture_nod()
+            if face_track is not None:
+                face_track.set_neck_output_enabled(True)
+
     try:
         while not rospy.is_shutdown():
             frame, obs = tracker.process_frame(
@@ -267,7 +278,24 @@ def main():
                 break
 
             fsm_ok = fsm is None or fsm.is_exec_default()
-            joy_blocking = joy is not None and not joy.allow_program_cmd()
+            joy_blocking = (
+                joy is not None and joy.blocks_gesture_control()
+            )
+            if joy is not None:
+                need_release = (
+                    (action_player is not None and action_player.is_busy)
+                    or (neck_thread is not None and neck_thread.is_busy)
+                )
+                if joy.poll_takeover_edge():
+                    if need_release:
+                        _release_gesture_control_to_joy()
+                    rospy.loginfo(
+                        "[hand_follow] 手柄接管: 已停手势动作/跟手, "
+                        "脸跟踪保持",
+                    )
+                elif joy_blocking and need_release:
+                    _release_gesture_control_to_joy()
+
             face_track_on = face_track is not None and face_track.is_active
 
             if (
@@ -306,7 +334,7 @@ def main():
                     obs.gesture,
                     has_hand=obs.has_hand,
                     in_range=obs.in_range,
-                    joy_blocking=joy is not None and not joy.allow_program_cmd(),
+                    joy_blocking=joy_blocking,
                     fsm_ok=fsm_ok,
                 )
 
