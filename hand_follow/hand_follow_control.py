@@ -296,7 +296,8 @@ def _step_toward(cur: float, goal: float, max_step: float) -> float:
 
 class NeckController(threading.Thread):
     """
-    识别到手：1 秒内抬头 10° 后保持（反馈），手离开再回中。
+    识别到手：1 秒内抬头 10°（反馈一次）然后自动回中。
+    - 手一直在画面中也不会重复触发，必须先“丢手”再“重新见手”才会再抬一次
   与 locate_face 同时运行时勿调用（由 hand_follow 在脸跟踪开启时禁用）。
     """
 
@@ -318,6 +319,7 @@ class NeckController(threading.Thread):
         self._lock = threading.Lock()
         self._phase = "idle"
         self._hand_prev = False
+        self._armed = True
         self._feedback_deadline = 0.0
         self._goal_yaw = 0.0
         self._goal_pitch = 0.0
@@ -333,23 +335,23 @@ class NeckController(threading.Thread):
             return self._phase
 
     def update_hand(self, detected: bool):
-        """手出现上升沿触发一次抬头反馈；手离开则回中。"""
+        """手出现上升沿触发一次抬头反馈；完成后自动回中。"""
         with self._lock:
             rising = detected and not self._hand_prev
             falling = not detected and self._hand_prev
             self._hand_prev = detected
             self._goal_yaw = 0.0
 
-            if rising:
+            if falling:
+                # 只有真正丢手后才重新武装下一次“抬一次头”
+                self._armed = True
+
+            if rising and self._armed:
+                self._armed = False
                 self._phase = "feedback"
                 self._feedback_deadline = (
                     time.time() + self._feedback_ramp_sec
                 )
-                self._goal_pitch = self._pitch_up_rad
-            elif falling and self._phase in ("feedback", "hold"):
-                self._phase = "return"
-                self._goal_pitch = 0.0
-            elif self._phase == "hold":
                 self._goal_pitch = self._pitch_up_rad
             elif self._phase == "return":
                 self._goal_pitch = 0.0
@@ -411,8 +413,9 @@ class NeckController(threading.Thread):
                 if phase == "feedback":
                     reached = abs(self._cur_pitch - goal_pitch) <= pitch_eps
                     if reached or time.time() >= self._feedback_deadline:
-                        self._phase = "hold"
-                        self._cur_pitch = goal_pitch
+                        # 反馈完成后立刻回中，避免与脸跟踪争抢导致抖动
+                        self._phase = "return"
+                        self._goal_pitch = 0.0
                 elif phase == "return":
                     if abs(self._cur_pitch) <= pitch_eps and abs(goal_pitch) < 1e-6:
                         self._phase = "idle"

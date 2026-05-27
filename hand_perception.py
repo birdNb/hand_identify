@@ -258,7 +258,6 @@ class HandObservation:
 
 
 def open_zed_camera(use_hd1080=True, dist_min=DIST_MIN_M, dist_max=DIST_MAX_M):
-    zed = sl.Camera()
     init_params = sl.InitParameters()
     init_params.camera_resolution = (
         sl.RESOLUTION.HD1080 if use_hd1080 else sl.RESOLUTION.HD720
@@ -269,13 +268,25 @@ def open_zed_camera(use_hd1080=True, dist_min=DIST_MIN_M, dist_max=DIST_MAX_M):
     init_params.depth_minimum_distance = dist_min
     init_params.depth_maximum_distance = dist_max
 
-    err = zed.open(init_params)
-    if err != sl.ERROR_CODE.SUCCESS and use_hd1080:
-        zed.close()
-        init_params.camera_resolution = sl.RESOLUTION.HD720
+    # 某些情况下(上次进程异常退出/USB带宽抖动)，zed.open 可能返回 STREAM FAILED。
+    # 这里做多次重试并逐步降级分辨率，尽量自动恢复。
+    last_err = None
+    for attempt in range(1, 6):
+        zed = sl.Camera()
         err = zed.open(init_params)
-    if err != sl.ERROR_CODE.SUCCESS:
-        raise RuntimeError(f"ZED 相机打开失败: {err}")
+        if err == sl.ERROR_CODE.SUCCESS:
+            break
+        last_err = err
+        try:
+            zed.close()
+        except Exception:
+            pass
+        if attempt == 1 and use_hd1080:
+            # 首次失败且原本是 1080 时，降级到 720 再继续重试
+            init_params.camera_resolution = sl.RESOLUTION.HD720
+        time.sleep(0.3 * attempt)
+    else:
+        raise RuntimeError(f"ZED 相机打开失败: {last_err}")
 
     res = zed.get_camera_information().camera_configuration.resolution
     print(
