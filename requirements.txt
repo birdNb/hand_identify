@@ -1,0 +1,5 @@
+opencv-python>=4.5.0
+mediapipe>=0.10.0
+numpy>=1.19.0
+colorama>=0.4.4
+# pyzed 需先安装 ZED SDK: https://www.stereolabs.com/developers/release/
