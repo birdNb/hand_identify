@@ -27,6 +27,8 @@ GESTURE_ACTION_LABELS: Dict[int, str] = {
     4: "踢球",
 }
 
+GESTURE_ACTION_HOLD_SEC = 2.0
+
 TERM_LINE_WIDTH = 96
 
 
@@ -53,12 +55,12 @@ def action_hint_for_gesture(gesture: int, *, face_track_on: bool = False) -> str
     if gesture == GESTURE_STOP:
         return GESTURE_ZERO_LABEL
     if gesture == GESTURE_HEAD_NOD:
-        return GESTURE_HEAD_NOD_LABEL
+        return "单指抬头(已禁用)"
     if gesture in GESTURE_ACTION_LABELS:
         spec = GESTURE_ACTION_SPECS[gesture]
         return f"动作:{GESTURE_ACTION_LABELS[gesture]}({spec[0]})"
     if gesture == GESTURE_FOLLOW:
-        return "跟手"
+        return "跟手(已禁用)"
     return ""
 
 
@@ -150,6 +152,62 @@ def log_gesture_action_edge(
     except ImportError:
         prefix = f"\n[{time.strftime('%H:%M:%S')}] "
     print(f"{prefix}{line}", flush=True)
+
+
+class GestureActionHold:
+    """手势 2~4 需连续稳定 hold_sec 后才输出，供动作库触发。"""
+
+    def __init__(self, hold_sec: float = GESTURE_ACTION_HOLD_SEC):
+        self.hold_sec = max(0.1, float(hold_sec))
+        self._candidate = -1
+        self._since = 0.0
+
+    def reset(self):
+        self._candidate = -1
+        self._since = 0.0
+
+    @property
+    def pending_gesture(self) -> int:
+        return self._candidate
+
+    @property
+    def progress(self) -> float:
+        if self._candidate < 0 or self._since <= 0:
+            return 0.0
+        return min(1.0, (time.time() - self._since) / self.hold_sec)
+
+    @property
+    def hold_remaining(self) -> float:
+        if self._candidate < 0:
+            return 0.0
+        return max(0.0, self.hold_sec - (time.time() - self._since))
+
+    def update(
+        self,
+        gesture: int,
+        *,
+        has_hand: bool,
+        in_range: bool,
+    ) -> int:
+        """
+        返回已确认的手势编号(2~4)，未满足稳定时长则返回 -1。
+        确认后会持续返回同一手势，直至手势变化或丢手。
+        """
+        if not has_hand or not in_range:
+            self.reset()
+            return -1
+        if gesture not in GESTURE_ACTION_SPECS:
+            self.reset()
+            return -1
+
+        now = time.time()
+        if gesture != self._candidate:
+            self._candidate = gesture
+            self._since = now
+            return -1
+        if now - self._since >= self.hold_sec:
+            return gesture
+        return -1
 
 
 class GestureZeroHandler:

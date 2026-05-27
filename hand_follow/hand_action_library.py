@@ -202,6 +202,10 @@ class GestureActionPlayer:
         """
         检测手势上升沿并触发动作。返回本帧是否新触发。
         """
+        if gesture not in GESTURE_ACTION_SPECS:
+            self._last_gesture = -1
+            return False
+
         prev = self._last_gesture
         self._last_gesture = gesture
 
@@ -210,8 +214,6 @@ class GestureActionPlayer:
         if not has_hand or not in_range:
             return False
         if gesture == 0:
-            return False
-        if gesture not in GESTURE_ACTION_SPECS:
             return False
         if gesture == prev:
             return False

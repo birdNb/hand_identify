@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# hand_follow_robot.py — 脸跟踪常开 + 手势 1 抬头20° + 手势 2~4 动作库 + 手势 5 跟手
+# hand_follow_robot.py — 脸跟踪常开 + 手势 2~4 动作库
 #
 # 手势 0: 急停+中止动作；按住 5s 退出程序
-# 手势 1: 抬头 20° 后复原（期间暂停脸跟踪脖子输出）
+# 手势 1: 单指抬头已禁用（避免与脸跟踪抢 /pi_plus_absolute）
 # 手势 2~4: 抬手 / 挥动双手 / 踢球（/joy_msg 动作库）
-# 手柄 /joy 有输入时：停手势跟手/动作库/点头，脸跟踪保持
-# 底盘: 误差 > 0.3m → 指令 ±0.3; 手静止不发指令
-# 脸部跟踪: 常开，与手势识别共用 ZED RGB
+# 手柄 /joy 有输入时：停手势动作库，脸跟踪保持
+# 手势 5 五指跟手: 已禁用，备份见 5_finger_locomotion.py
 
 import argparse
 import os
@@ -34,38 +33,25 @@ from hand_perception import (
     ZedHandTracker,
 )
 from gesture_actions import (
-    GESTURE_ACTION_LABELS,
+    GESTURE_ACTION_HOLD_SEC,
+    GESTURE_ACTION_SPECS,
     GESTURE_FACE_TRACK_LABEL,
-    GESTURE_HEAD_NOD,
-    GESTURE_HEAD_NOD_LABEL,
     GESTURE_STOP,
     GESTURE_ZERO_EXIT_SEC,
-    GESTURE_ZERO_LABEL,
+    GestureActionHold,
     GestureZeroHandler,
-    log_gesture_head_nod,
     log_gesture_zero_estop,
     log_gesture_zero_exit,
 )
 from hand_action_library import GestureActionPlayer
 from face_tracker import IntegratedFaceTracker
-from hand_follow_control import (
-    FsmStateMonitor,
-    CmdVelPublisher,
-    HandControlInput,
-    HandFollowController,
-    HandMotionGate,
-    JoyMonitor,
-    NeckController,
-    VelCommand,
-    GESTURE_FOLLOW,
-    JOY_IDLE_SEC,
-    POS_THRESH_M,
-    CMD_MAG,
-    HAND_MOVE_THRESH_M,
-)
+from hand_follow_control import FsmStateMonitor, JoyMonitor, JOY_IDLE_SEC
 
 FULLSCREEN = True
-WINDOW_NAME = "Hand Follow (Gesture 5)"
+WINDOW_NAME = "Hand Follow"
+
+# OpenCV 默认字体无法显示中文，GUI 仅用 ASCII
+GESTURE_UI_EN = {2: "hello", 3: "cheer", 4: "kick"}
 
 
 def draw_text(frame, text, pos, color=(0, 255, 0), scale=0.6, thick=2):
@@ -75,19 +61,13 @@ def draw_text(frame, text, pos, color=(0, 255, 0), scale=0.6, thick=2):
     )
 
 
-def _fmt_cmd(v):
-    if abs(v) < 1e-6:
-        return "0"
-    return f"{v:+.1f}"
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="手势跟手 + 脸跟踪(默认开) + 动作库",
+        description="手势识别 + 脸跟踪(常开) + 动作库",
     )
     parser.add_argument(
         "--preview", action="store_true",
-        help="预览模式：不发 /cmd_vel、/joy_msg，不启脸跟踪控头",
+        help="预览模式：不发 /joy_msg，不启脸跟踪控头",
     )
     parser.add_argument(
         "--enable-motion", action="store_true",
@@ -96,7 +76,6 @@ def main():
     parser.add_argument("--no-gui", action="store_true")
     parser.add_argument("--no-fsm", action="store_true")
     parser.add_argument("--no-joy", action="store_true")
-    parser.add_argument("--no-neck", action="store_true", help="不控制脖子抬头")
     parser.add_argument(
         "--no-actions", action="store_true",
         help="禁用手势 2~4 动作库触发",
@@ -106,31 +85,23 @@ def main():
         help="禁用内嵌脸部跟踪 (默认开启，共用 ZED RGB)",
     )
     parser.add_argument(
-        "--no-face-track-auto", action="store_true",
-        help="(已废弃) 脸跟踪现为常开，此参数无效果",
-    )
-    parser.add_argument(
         "--hd1080", action="store_true",
         help="使用 HD1080 (默认 HD720，更流畅)",
     )
     parser.add_argument(
         "--fast", action="store_true",
-        help="性能模式: 640px + 脸检测每2帧 (等同 --proc-max-w 640)",
+        help="性能模式: 640px + 脸检测降频",
     )
-    parser.add_argument("--target-dist", type=float, default=1.0)
     parser.add_argument("--dist-min", type=float, default=DIST_MIN_M)
     parser.add_argument("--dist-max", type=float, default=DIST_MAX_M)
-    parser.add_argument("--pos-thresh", type=float, default=POS_THRESH_M)
-    parser.add_argument("--cmd-mag", type=float, default=CMD_MAG,
-                        help="跟手指令幅度 (默认 0.3)")
-    parser.add_argument(
-        "--move-thresh", type=float, default=HAND_MOVE_THRESH_M,
-        help="判定手在动的位移阈值/米",
-    )
     parser.add_argument("--proc-max-w", type=int, default=640)
     parser.add_argument(
         "--zero-exit-sec", type=float, default=GESTURE_ZERO_EXIT_SEC,
         help="手势0持续按住多少秒后退出 (默认 5)",
+    )
+    parser.add_argument(
+        "--gesture-hold-sec", type=float, default=GESTURE_ACTION_HOLD_SEC,
+        help="手势2~4连续稳定多少秒后触发动作 (默认 2)",
     )
     args = parser.parse_args()
     if args.fast:
@@ -148,22 +119,8 @@ def main():
         use_hd1080=args.hd1080,
         proc_max_w=args.proc_max_w,
     )
-    follow_ctrl = HandFollowController(
-        target_distance_m=args.target_dist,
-        pos_thresh_m=args.pos_thresh,
-        cmd_mag=args.cmd_mag,
-    )
-    motion_gate = HandMotionGate(move_thresh_m=args.move_thresh)
-    vel_cmd = VelCommand()
     fsm = None if args.no_fsm else FsmStateMonitor()
     joy = None if args.no_joy else JoyMonitor()
-    pub_thread = CmdVelPublisher(vel_cmd, fsm, dry_run=dry_run)
-    pub_thread.start()
-
-    neck_thread = None
-    if not args.no_neck:
-        neck_thread = NeckController(fsm, dry_run=dry_run)
-        neck_thread.start()
 
     action_player = None
     if not args.no_actions:
@@ -171,7 +128,7 @@ def main():
 
     face_track = None
     if not args.no_face_track:
-        mesh_iv = 3 if args.fast else 2
+        mesh_iv = 1
         roi_iv = 10 if args.fast else 8
         face_track = IntegratedFaceTracker(
             fsm,
@@ -190,19 +147,16 @@ def main():
         else "2抬手 3挥双手 4踢球"
     )
     zero_handler = GestureZeroHandler(exit_hold_sec=args.zero_exit_sec)
+    action_hold = GestureActionHold(hold_sec=args.gesture_hold_sec)
     if dry_run:
-        rospy.logwarn(
-            "[hand_follow] 预览模式 (--preview)：不发运动指令、不启脸跟踪子进程",
-        )
+        rospy.logwarn("[hand_follow] 预览模式 (--preview)")
     rospy.loginfo(
-        "[hand_follow] 指令 ±%.2f 阈值 %.2fm | 手移动阈值 %.2fm | "
-        "手势%d跟手 | 脸跟踪=%s | 动作库=%s | 手势0按住%.0fs退出 | 脖子=%s | %s | %s",
-        args.cmd_mag, args.pos_thresh, args.move_thresh,
-        GESTURE_FOLLOW,
+        "[hand_follow] 脸跟踪=%s | 动作库=%s(稳定%.1fs) | 手势1抬头=关 | "
+        "手势0按住%.0fs退出 | %s | %s",
         face_hint,
         action_hint,
+        args.gesture_hold_sec,
         args.zero_exit_sec,
-        "手势1抬头20°" if not args.no_neck else "关",
         "DRY-RUN" if dry_run else "MOTION",
         joy_hint,
     )
@@ -226,17 +180,9 @@ def main():
                 WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN,
             )
 
-    prev_gesture = -1
-    neck_nod_was_busy = False
-
     def _release_gesture_control_to_joy():
-        """手柄接管：停动作库、停手势1点头、恢复脸跟踪控脖。"""
         if action_player is not None and action_player.is_busy:
             action_player.abort()
-        if neck_thread is not None and neck_thread.is_busy:
-            neck_thread.abort_gesture_nod()
-            if face_track is not None:
-                face_track.set_neck_output_enabled(True)
 
     try:
         while not rospy.is_shutdown():
@@ -251,10 +197,6 @@ def main():
             if palm_pos is not None:
                 palm_x, palm_y = palm_pos[0], palm_pos[1]
 
-            hand_seen = obs.has_hand and palm_pos is not None
-
-            hand_moving = motion_gate.update(palm_pos)
-
             zero_estop, zero_exit, zero_hold = zero_handler.update(
                 obs.gesture,
                 has_hand=obs.has_hand,
@@ -263,12 +205,10 @@ def main():
             if zero_estop:
                 if zero_hold < 0.15:
                     log_gesture_zero_estop(dry_run=dry_run)
-                    rospy.logwarn("[hand_follow] 手势0急停: 停止动作与 cmd_vel")
+                    rospy.logwarn("[hand_follow] 手势0急停")
                 if action_player is not None:
                     action_player.abort()
-                follow_ctrl.reset()
-                motion_gate.reset()
-                vel_cmd.stop()
+                action_hold.reset()
             if zero_exit:
                 log_gesture_zero_exit(zero_hold)
                 rospy.loginfo(
@@ -283,94 +223,35 @@ def main():
             )
             if joy is not None:
                 need_release = (
-                    (action_player is not None and action_player.is_busy)
-                    or (neck_thread is not None and neck_thread.is_busy)
+                    action_player is not None and action_player.is_busy
                 )
                 if joy.poll_takeover_edge():
                     if need_release:
                         _release_gesture_control_to_joy()
                     rospy.loginfo(
-                        "[hand_follow] 手柄接管: 已停手势动作/跟手, "
-                        "脸跟踪保持",
+                        "[hand_follow] 手柄接管: 已停手势动作, 脸跟踪保持",
                     )
                 elif joy_blocking and need_release:
                     _release_gesture_control_to_joy()
 
             face_track_on = face_track is not None and face_track.is_active
 
-            if (
-                neck_thread is not None
-                and obs.gesture == GESTURE_HEAD_NOD
-                and prev_gesture != GESTURE_HEAD_NOD
-                and obs.has_hand
-                and obs.in_range
-                and fsm_ok
-                and not joy_blocking
-                and not zero_estop
-            ):
-                hold_yaw = 0.0
-                start_pitch = 0.0
-                if face_track is not None:
-                    hold_yaw, start_pitch = face_track.get_neck_target()
-                if neck_thread.trigger_gesture_nod(
-                    hold_yaw_rad=hold_yaw,
-                    start_pitch_rad=start_pitch,
-                ):
-                    if face_track is not None:
-                        face_track.set_neck_output_enabled(False)
-                    log_gesture_head_nod(dry_run=dry_run)
-
-            neck_nod_busy = (
-                neck_thread is not None and neck_thread.is_busy
-            )
-            if neck_nod_was_busy and not neck_nod_busy and face_track is not None:
-                face_track.set_neck_output_enabled(True)
-            neck_nod_was_busy = neck_nod_busy
-            prev_gesture = obs.gesture
-
-            action_fired = False
+            confirmed_action_g = -1
             if action_player is not None and obs.gesture != GESTURE_STOP:
-                action_fired = action_player.update(
+                confirmed_action_g = action_hold.update(
                     obs.gesture,
+                    has_hand=obs.has_hand,
+                    in_range=obs.in_range,
+                )
+                action_fired = action_player.update(
+                    confirmed_action_g,
                     has_hand=obs.has_hand,
                     in_range=obs.in_range,
                     joy_blocking=joy_blocking,
                     fsm_ok=fsm_ok,
                 )
-
-            ctrl_inp = HandControlInput(
-                gesture=obs.gesture,
-                distance_m=obs.distance_m,
-                palm_x_m=palm_x,
-                palm_y_m=palm_y,
-                active=obs.valid_for_control,
-            )
-
-            action_busy = (
-                action_player is not None and action_player.is_busy
-            )
-            if zero_estop or joy_blocking or action_fired or action_busy:
-                follow_ctrl.reset()
-                out_cmd_x, out_cmd_y, out_cmd_z = 0.0, 0.0, 0.0
-                if zero_estop:
-                    mode = "estop"
-                elif joy_blocking:
-                    mode = "joy"
-                else:
-                    mode = "action"
-            elif not ctrl_inp.active or not hand_moving:
-                follow_ctrl.reset()
-                out_cmd_x, out_cmd_y, out_cmd_z = 0.0, 0.0, 0.0
-                if not ctrl_inp.active:
-                    mode = "idle"
-                else:
-                    mode = "hold"
             else:
-                out = follow_ctrl.compute(ctrl_inp)
-                out_cmd_x, out_cmd_y, out_cmd_z = out.cmd_x, out.cmd_y, out.cmd_z
-                mode = out.mode
-
-            vel_cmd.set(out_cmd_x, out_cmd_y, out_cmd_z)
+                action_fired = False
 
             if obs.palm_px is not None and not tracker.lite_display:
                 col = (0, 255, 0) if obs.in_range else (0, 165, 255)
@@ -385,57 +266,35 @@ def main():
                 gcol = GESTURE_COLORS_BGR[min(obs.gesture, 5)]
                 draw_text(frame, f"Gesture: {obs.gesture}", (10, 40), gcol, 1.0, 3)
             elif obs.has_hand and not obs.in_range:
-                draw_text(frame, obs.direction, (10, 40), (0, 165, 255), 0.8, 2)
+                draw_text(frame, "OUT OF RANGE", (10, 40), (0, 165, 255), 0.8, 2)
 
-            if neck_nod_busy:
-                phase = neck_thread.phase if neck_thread else "idle"
-                if phase == "feedback":
-                    neck_tag = "GESTURE1 抬头20°"
-                elif phase == "return":
-                    neck_tag = "GESTURE1 回中"
-                else:
-                    neck_tag = "GESTURE1"
-            elif face_track_on:
-                neck_tag = "FACE_TRACK"
-            else:
-                neck_tag = ""
+            neck_tag = "FACE_TRACK" if face_track_on else ""
             draw_text(
                 frame,
-                f"palm X:{palm_x:+.2f} Y:{palm_y:+.2f} Z:{obs.distance_m:.2f}m  "
-                f"{'MOVE' if hand_moving else 'HOLD'} {neck_tag}",
+                f"palm X:{palm_x:+.2f} Y:{palm_y:+.2f} Z:{obs.distance_m:.2f}m {neck_tag}",
                 (10, 80), (255, 255, 255), 0.55, 1,
-            )
-            draw_text(
-                frame,
-                f"cmd ±{args.cmd_mag:.1f} thresh {args.pos_thresh:.1f}m",
-                (10, h - 50), (180, 180, 180), 0.5, 1,
             )
 
             if zero_estop:
                 remain = zero_handler.hold_remaining(zero_hold)
                 draw_text(
                     frame,
-                    f"手势0 {GESTURE_ZERO_LABEL} 退出倒计时 {remain:.1f}s",
+                    f"G0 E-STOP exit {remain:.1f}s",
                     (10, 120), (0, 0, 255), 0.75, 2,
                 )
-            elif neck_nod_busy:
-                draw_text(
-                    frame,
-                    f"手势1 {GESTURE_HEAD_NOD_LABEL}",
-                    (10, 120), (0, 255, 200), 0.75, 2,
-                )
             elif face_track_on:
-                draw_text(
-                    frame,
-                    f"{GESTURE_FACE_TRACK_LABEL}: 运行中",
-                    (10, 120), (0, 255, 128), 0.75, 2,
-                )
+                ov = face_track.overlay if face_track else None
+                if ov is not None and ov.has_face:
+                    yaw_d, pitch_d = face_track.get_neck_target_deg()
+                    face_txt = f"FACE yaw{yaw_d:+.0f} pitch{pitch_d:+.0f}"
+                else:
+                    face_txt = "FACE search..."
+                draw_text(frame, face_txt, (10, 120), (0, 255, 128), 0.75, 2)
             elif action_player is not None and (
                 action_fired or action_player.is_busy
             ):
-                act_txt = action_player.last_label or "动作"
                 draw_text(
-                    frame, f"动作: {act_txt}",
+                    frame, "ACT: running",
                     (10, 120), (255, 128, 0), 0.75, 2,
                 )
             elif joy_blocking:
@@ -443,25 +302,26 @@ def main():
                     frame, f"JOY ({joy.idle_remaining():.1f}s)",
                     (10, 120), (0, 128, 255), 0.75, 2,
                 )
-            elif ctrl_inp.active and hand_moving:
+            elif (
+                obs.has_hand
+                and obs.in_range
+                and obs.gesture in GESTURE_ACTION_SPECS
+                and action_hold.progress < 1.0
+            ):
+                remain = action_hold.hold_remaining
+                pct = action_hold.progress * 100.0
                 draw_text(
                     frame,
-                    f"CMD X:{_fmt_cmd(out_cmd_x)} "
-                    f"Y:{_fmt_cmd(out_cmd_y)} "
-                    f"Z:{_fmt_cmd(out_cmd_z)} [{mode}]",
-                    (10, 120), (0, 255, 255), 0.75, 2,
+                    f"G{obs.gesture} hold {pct:.0f}% ({remain:.1f}s)",
+                    (10, 120), (0, 200, 255), 0.7, 2,
                 )
-            elif ctrl_inp.active and not hand_moving:
-                draw_text(frame, "手势5 手静止-无指令", (10, 120), (128, 200, 255), 0.7, 2)
             else:
-                if obs.has_hand and obs.in_range and obs.gesture == GESTURE_HEAD_NOD:
-                    hint = f"手势1→{GESTURE_HEAD_NOD_LABEL}"
-                elif obs.has_hand and obs.in_range and obs.gesture in GESTURE_ACTION_LABELS:
-                    hint = f"手势{obs.gesture}→{GESTURE_ACTION_LABELS[obs.gesture]}"
+                if obs.has_hand and obs.in_range and obs.gesture in GESTURE_UI_EN:
+                    hint = f"G{obs.gesture} {GESTURE_UI_EN[obs.gesture]}"
                 elif obs.has_hand:
-                    hint = "0急停 1抬头20° 2~4动作 5跟手"
+                    hint = "G0 estop G2-4 act | face on"
                 else:
-                    hint = "无手"
+                    hint = "no hand"
                 draw_text(frame, hint, (10, 120), (128, 128, 128), 0.7, 2)
 
             tag = "MOTION" if not dry_run else "PREVIEW"
@@ -475,12 +335,12 @@ def main():
             )
             block_parts = []
             if dry_run:
-                block_parts.append("预览--preview")
+                block_parts.append("preview")
             if not fsm_ok:
                 block_parts.append("FSM!=5")
             if joy_blocking:
-                block_parts.append("JOY占用")
-            block_txt = " ".join(block_parts) if block_parts else "可控制"
+                block_parts.append("JOY")
+            block_txt = " ".join(block_parts) if block_parts else "OK"
             draw_text(
                 frame, f"{fsm_txt} | {block_txt}",
                 (10, h - 28), (0, 200, 255) if block_parts else (0, 220, 0),
@@ -504,14 +364,8 @@ def main():
         rospy.logwarn("[hand_follow] 用户中断")
 
     finally:
-        vel_cmd.stop()
-        pub_thread.publish_stop_blocking(0.5)
-        pub_thread.stop()
         if face_track is not None:
             face_track.shutdown()
-        if neck_thread is not None:
-            neck_thread.publish_center_blocking(0.5)
-            neck_thread.stop()
         tracker.close()
         if not args.no_gui:
             cv2.destroyAllWindows()

@@ -29,13 +29,15 @@ DETECT_CONFIDENCE = 0.4
 TRACK_CONFIDENCE = 0.5
 ROI_PAD_RATIO = 0.30
 
-DEAD_BAND_X = 0.04
+DEAD_BAND_X = 0.02
 DEAD_BAND_Y = 0.05
-K_YAW_DEG = 20.0
+K_YAW_DEG = 30.0
 K_PITCH_DEG = 15.0
-MAX_STEP_YAW_DEG = 6.0
+MAX_STEP_YAW_DEG = 8.0
 MAX_STEP_PITCH_DEG = 5.0
-TARGET_EMA_ALPHA = 0.6
+TARGET_EMA_ALPHA = 0.75
+# ZED 左目若左右与预期相反，改为 -1.0
+YAW_DX_SIGN = 1.0
 YAW_LIMIT_DEG = 80.0
 PITCH_UP_DEG = -40.0
 PITCH_DOWN_DEG = 60.0
@@ -44,7 +46,7 @@ NO_FACE_RETURN_HOME_SEC = 1.0
 RETURN_HOME_RATE_DEG_PER_SEC = 45.0
 
 # ----- 性能：降频视觉推理，减少双模型与 ROI 开销 -----
-FACE_MESH_INTERVAL = 2
+FACE_MESH_INTERVAL = 1
 ROI_FALLBACK_INTERVAL = 8
 FACE_TRACK_GRACE_SEC = 1.2
 
@@ -96,7 +98,10 @@ def _update_target_from_error(
     if abs(dy_n) < DEAD_BAND_Y:
         dy_n = 0.0
 
-    delta_yaw_deg = _clamp(-K_YAW_DEG * dx_n, -MAX_STEP_YAW_DEG, MAX_STEP_YAW_DEG)
+    dx_ctrl = YAW_DX_SIGN * dx_n
+    delta_yaw_deg = _clamp(
+        -K_YAW_DEG * dx_ctrl, -MAX_STEP_YAW_DEG, MAX_STEP_YAW_DEG,
+    )
     delta_pitch_deg = _clamp(
         K_PITCH_DEG * dy_n, -MAX_STEP_PITCH_DEG, MAX_STEP_PITCH_DEG,
     )
@@ -140,18 +145,11 @@ class _NeckTarget:
 class _FaceNeckPublisher(threading.Thread):
     """固定频率发布脖子目标到 /pi_plus_absolute。"""
 
-    def __init__(
-        self,
-        target: _NeckTarget,
-        fsm,
-        dry_run: bool,
-        neck_output_enabled,
-    ):
+    def __init__(self, target: _NeckTarget, fsm, dry_run: bool):
         super().__init__(daemon=True)
         self._target = target
         self._fsm = fsm
         self._dry_run = dry_run
-        self._neck_output_enabled = neck_output_enabled
         self._stop_evt = threading.Event()
         self._pub = rospy.Publisher(ABSOLUTE_TOPIC, JointState, queue_size=10)
         self._rate = rospy.Rate(PUBLISH_RATE_HZ)
@@ -181,9 +179,6 @@ class _FaceNeckPublisher(threading.Thread):
             if self._fsm is not None and not self._fsm.is_exec_default():
                 self._rate.sleep()
                 continue
-            if not self._neck_output_enabled():
-                self._rate.sleep()
-                continue
             yaw, pitch = self._target.get()
             msg.position = [yaw, pitch]
             msg.header.stamp = rospy.Time.now()
@@ -201,7 +196,7 @@ class FaceOverlay:
 
 
 class IntegratedFaceTracker:
-    """与 ZedHandTracker 共用 proc RGB；人脸检测常开；脖子输出可临时切断(手势1)。"""
+    """与 ZedHandTracker 共用 proc RGB；人脸检测与脖子跟踪常开。"""
 
     def __init__(
         self,
@@ -216,8 +211,6 @@ class IntegratedFaceTracker:
         self._mesh_interval = max(1, int(mesh_interval))
         self._roi_interval = max(2, int(roi_interval))
         self._enabled = True
-        self._neck_output_enabled = True
-        self._neck_lock = threading.Lock()
 
         self._target = _NeckTarget()
         self._ctrl_state: Dict[str, float] = {"yaw_rad": 0.0, "pitch_rad": 0.0}
@@ -239,13 +232,25 @@ class IntegratedFaceTracker:
             model_selection=0,
             min_detection_confidence=DETECT_CONFIDENCE,
         )
-        self._publisher = _FaceNeckPublisher(
-            self._target,
-            fsm,
-            dry_run,
-            self.is_neck_output_enabled,
-        )
+        self._publisher = _FaceNeckPublisher(self._target, fsm, dry_run)
         self._publisher.start()
+        if not dry_run:
+            t0 = time.time()
+            while (
+                self._publisher._pub.get_num_connections() == 0
+                and not rospy.is_shutdown()
+                and time.time() - t0 < 3.0
+            ):
+                time.sleep(0.05)
+            n = self._publisher._pub.get_num_connections()
+            if n == 0:
+                rospy.logwarn(
+                    "[face_track] /pi_plus_absolute 无订阅者, 脖子可能不动",
+                )
+            else:
+                rospy.loginfo(
+                    "[face_track] /pi_plus_absolute 订阅者=%d", n,
+                )
         rospy.loginfo(
             "[face_track] %s 常开 mesh/%df roi/%df, dry_run=%s",
             GESTURE_FACE_TRACK_LABEL,
@@ -262,26 +267,13 @@ class IntegratedFaceTracker:
     def overlay(self) -> FaceOverlay:
         return self._overlay
 
-    def is_neck_output_enabled(self) -> bool:
-        with self._neck_lock:
-            return self._neck_output_enabled
-
-    def set_neck_output_enabled(self, enabled: bool) -> None:
-        with self._neck_lock:
-            prev = self._neck_output_enabled
-            self._neck_output_enabled = bool(enabled)
-        if prev and not enabled:
-            rospy.loginfo_throttle(
-                1.0, "[face_track] 脸跟踪脖子输出已暂停(手势1点头)",
-            )
-        elif not prev and enabled:
-            rospy.loginfo_throttle(
-                1.0, "[face_track] 脸跟踪脖子输出已恢复",
-            )
-
     def get_neck_target(self) -> Tuple[float, float]:
-        """当前脸跟踪脖子目标 (yaw_rad, pitch_rad)。"""
+        """当前脖子目标 (yaw_rad, pitch_rad)。"""
         return self._target.get()
+
+    def get_neck_target_deg(self) -> Tuple[float, float]:
+        y, p = self._target.get()
+        return math.degrees(y), math.degrees(p)
 
     def start(self) -> bool:
         """兼容启动接口；检测常开，仅重置计时。"""
@@ -315,7 +307,7 @@ class IntegratedFaceTracker:
         new_yaw, new_pitch = _update_target_from_error(
             cur_yaw, cur_pitch, dx_n, dy_n, self._ctrl_state,
         )
-        if not self._dry_run and self.is_neck_output_enabled():
+        if not self._dry_run:
             self._target.set(new_yaw, new_pitch)
         self._last_face_t = loop_now
         self._homing_logged = False
@@ -350,7 +342,7 @@ class IntegratedFaceTracker:
                 )
                 if abs(cur_pitch) > 1e-4 else 0.0
             )
-            if not self._dry_run and self.is_neck_output_enabled():
+            if not self._dry_run:
                 self._target.set(new_yaw, new_pitch)
             self._ctrl_state["yaw_rad"] = new_yaw
             self._ctrl_state["pitch_rad"] = new_pitch
@@ -442,21 +434,39 @@ class IntegratedFaceTracker:
 
         if res.multi_face_landmarks:
             lm = res.multi_face_landmarks[0]
+            xs = [p.x for p in lm.landmark]
+            ys = [p.y for p in lm.landmark]
+            face_cx_n = sum(xs) / len(xs)
+            face_cy_n = sum(ys) / len(ys)
+            dx_n = (face_cx_n - 0.5) * 2.0
+            dy_n = (face_cy_n - 0.5) * 2.0
             px1, py1, px2, py2 = _face_bbox_from_landmarks(
                 lm, proc_w, proc_h, pad=12,
             )
             scale_x = w / max(proc_w, 1)
             scale_y = h / max(proc_h, 1)
-            face_cx = (px1 + px2) / 2.0 * scale_x
-            face_cy = (py1 + py2) / 2.0 * scale_y
-            dx_n = (face_cx - cx_img) / (w / 2.0)
-            dy_n = (face_cy - cy_img) / (h / 2.0)
+            fx1 = int(px1 * scale_x)
+            fy1 = int(py1 * scale_y)
+            fx2 = int(px2 * scale_x)
+            fy2 = int(py2 * scale_y)
             self._cached_dx = dx_n
             self._cached_dy = dy_n
-            return self._apply_face_error(
-                dx_n, dy_n, loop_now, frame_bgr, proc_w, proc_h,
-                used_roi=used_roi,
+            cur_yaw, cur_pitch = self._target.get()
+            new_yaw, new_pitch = _update_target_from_error(
+                cur_yaw, cur_pitch, dx_n, dy_n, self._ctrl_state,
             )
+            if not self._dry_run:
+                self._target.set(new_yaw, new_pitch)
+            self._last_face_t = loop_now
+            self._homing_logged = False
+            overlay = FaceOverlay(
+                has_face=True,
+                used_roi=used_roi,
+                bbox=(fx1, fy1, fx2, fy2),
+                center=(int((fx1 + fx2) / 2), int((fy1 + fy2) / 2)),
+            )
+            self._overlay = overlay
+            return overlay
 
         self._cached_dx = None
         self._cached_dy = None
@@ -476,10 +486,20 @@ class IntegratedFaceTracker:
             cv2.line(
                 frame_bgr, (cx_i, cy_i), ov.center, col, 2,
             )
+        yaw_d, pitch_d = self.get_neck_target_deg()
+        cv2.putText(
+            frame_bgr,
+            f"yaw {yaw_d:+.1f} pitch {pitch_d:+.1f}",
+            (fx1, max(16, fy1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            col,
+            1,
+            cv2.LINE_AA,
+        )
 
     def shutdown(self):
         self._enabled = False
-        self.set_neck_output_enabled(False)
         self._target.set(0.0, 0.0)
         if not self._dry_run:
             self._publisher.publish_center_blocking(0.35)

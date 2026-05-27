@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""手势 5 跟手: 位置误差 > 阈值 → ±CMD_MAG; 手静止不发指令; 脖子跟手检测抬头。"""
+"""FSM / 手柄仲裁 / 手势1脖子点头。五指跟手见 5_finger_locomotion.py（默认关闭）。"""
 
 import math
 import threading
 import time
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import rospy
-from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Joy, JointState
 from std_msgs.msg import Int32
 
 # ----- ROS -----
-CMD_VEL_TOPIC = "/cmd_vel"
 JOY_TOPIC = "/joy"
 FSM_STATE_TOPIC = "/fsm_state"
 JOY_ACTIVE_THRESH = 0.15
@@ -24,15 +21,6 @@ JOY_TRIGGER_AXIS_IDS = (2, 5)
 JOY_TRIGGER_REST = 1.0
 JOY_TRIGGER_ACTIVE_MARGIN = 0.35
 FSM_EXEC_DEFAULT = 5
-PUBLISH_RATE_HZ = 20
-
-# ----- 跟手目标 -----
-TARGET_DISTANCE_M = 1.0
-POS_THRESH_M = 0.3
-CMD_MAG = 0.3
-LATERAL_ROTATE_THRESH_M = 0.5
-HAND_MOVE_THRESH_M = 0.04
-
 # ----- 脖子 (与 locate_face 一致: pitch 负=抬头) -----
 ABSOLUTE_TOPIC = "/pi_plus_absolute"
 HEAD_YAW_JOINT = "head_yaw_joint"
@@ -42,119 +30,9 @@ GESTURE_NOD_RAMP_SEC = 1.0         # 1 秒内抬到目标
 NECK_RETURN_RAMP_DEG_PER_SEC = 8.0 # 复原回中角速度
 NECK_PUBLISH_RATE_HZ = 50
 
-CMD_VALID_SEC = 0.5
-GESTURE_FOLLOW = 5
-
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-def bang_cmd(
-    error_m: float,
-    thresh_m: float = POS_THRESH_M,
-    magnitude: float = CMD_MAG,
-) -> float:
-    """误差超过阈值 → ±magnitude, 否则 0。"""
-    if abs(error_m) <= thresh_m:
-        return 0.0
-    return magnitude if error_m > 0 else -magnitude
-
-
-class HandMotionGate:
-    """手不动不发指令: 帧间掌心位移超过阈值才允许底盘控制。"""
-
-    def __init__(self, move_thresh_m: float = HAND_MOVE_THRESH_M):
-        self.move_thresh_m = move_thresh_m
-        self._prev = None
-        self.is_moving = False
-
-    def reset(self):
-        self._prev = None
-        self.is_moving = False
-
-    def update(self, palm_pos: Optional[Tuple[float, float, float]]) -> bool:
-        if palm_pos is None:
-            self.reset()
-            return False
-        if self._prev is None:
-            self._prev = palm_pos
-            self.is_moving = False
-            return False
-        dx = palm_pos[0] - self._prev[0]
-        dy = palm_pos[1] - self._prev[1]
-        dz = palm_pos[2] - self._prev[2]
-        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-        self._prev = palm_pos
-        self.is_moving = dist >= self.move_thresh_m
-        return self.is_moving
-
-
-@dataclass
-class HandControlInput:
-    gesture: int = -1
-    distance_m: float = 0.0
-    palm_x_m: float = 0.0
-    palm_y_m: float = 0.0
-    active: bool = False
-
-
-@dataclass
-class HandControlOutput:
-    """控制指令 X/Y/Z ∈ {-1, 0, +1} → cmd_vel linear.x / linear.y / angular.z"""
-    cmd_x: float = 0.0
-    cmd_y: float = 0.0
-    cmd_z: float = 0.0
-    mode: str = "idle"
-
-
-class HandFollowController:
-    def __init__(
-        self,
-        target_distance_m=TARGET_DISTANCE_M,
-        pos_thresh_m=POS_THRESH_M,
-        rotate_thresh_m=LATERAL_ROTATE_THRESH_M,
-        cmd_mag: float = CMD_MAG,
-    ):
-        self.target_distance_m = target_distance_m
-        self.pos_thresh_m = pos_thresh_m
-        self.rotate_thresh_m = rotate_thresh_m
-        self.cmd_mag = cmd_mag
-        self.last_out = HandControlOutput()
-
-    def reset(self):
-        self.last_out = HandControlOutput()
-
-    def compute(self, inp: HandControlInput) -> HandControlOutput:
-        if not inp.active or inp.gesture != GESTURE_FOLLOW:
-            self.reset()
-            return self.last_out
-
-        # X: 深度 Z 与目标距离误差 → 前后 (linear.x)
-        e_depth = inp.distance_m - self.target_distance_m
-        mag = self.cmd_mag
-        cmd_x = bang_cmd(e_depth, self.pos_thresh_m, mag)
-
-        e_x = inp.palm_x_m
-        e_y = inp.palm_y_m
-
-        if abs(e_x) > self.rotate_thresh_m:
-            cmd_y = 0.0
-            cmd_z = bang_cmd(-e_x, self.pos_thresh_m, mag)
-            mode = "rotate"
-        else:
-            cmd_y = bang_cmd(e_x, self.pos_thresh_m, mag)
-            cmd_z = bang_cmd(-e_y, self.pos_thresh_m, mag)
-            mode = "track"
-
-        out = HandControlOutput(cmd_x=cmd_x, cmd_y=cmd_y, cmd_z=cmd_z, mode=mode)
-        self.last_out = out
-        return out
-
-
 class JoyMonitor:
     """
-    监听物理手柄 /joy。有输入时 block 手势底盘/动作库；脸跟踪不受影响。
+    监听物理手柄 /joy。有输入时 block 手势动作库/点头；脸跟踪不受影响。
   手柄松开后需空闲 idle_sec 才恢复手势控制。
     """
 
@@ -200,7 +78,7 @@ class JoyMonitor:
             return (time.time() - self._last_active_t) < self._idle_sec
 
     def blocks_gesture_control(self) -> bool:
-        """为 True 时手势跟手/动作库/手势1点头应让路给手柄。"""
+        """为 True 时手势动作库应让路给手柄。"""
         return not self.allow_program_cmd()
 
     def allow_program_cmd(self) -> bool:
@@ -221,34 +99,6 @@ class JoyMonitor:
             if self._last_active_t <= 0:
                 return 0.0
             return max(0.0, self._idle_sec - (time.time() - self._last_active_t))
-
-
-class VelCommand:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._cmd_x = 0.0
-        self._cmd_y = 0.0
-        self._cmd_z = 0.0
-        self._t = time.time()
-        self._stale_after = 0.0
-
-    def set(self, cmd_x: float, cmd_y: float, cmd_z: float,
-            valid_for_sec: float = CMD_VALID_SEC):
-        with self._lock:
-            self._cmd_x = cmd_x
-            self._cmd_y = cmd_y
-            self._cmd_z = cmd_z
-            self._t = time.time()
-            self._stale_after = valid_for_sec
-
-    def get(self):
-        with self._lock:
-            if self._stale_after > 0 and time.time() - self._t > self._stale_after:
-                return 0.0, 0.0, 0.0, True
-            return self._cmd_x, self._cmd_y, self._cmd_z, False
-
-    def stop(self):
-        self.set(0.0, 0.0, 0.0, valid_for_sec=0.0)
 
 
 class FsmStateMonitor:
@@ -440,56 +290,5 @@ class NeckController(threading.Thread):
             if phase != "idle" and not self._dry_run:
                 msg.position = [yaw, pitch]
                 msg.header.stamp = rospy.Time.now()
-                self._pub.publish(msg)
-            self._rate.sleep()
-
-
-class CmdVelPublisher(threading.Thread):
-    def __init__(self, vel: VelCommand, fsm: Optional[FsmStateMonitor], dry_run: bool):
-        super().__init__(daemon=True)
-        self._vel = vel
-        self._fsm = fsm
-        self._dry_run = dry_run
-        self._pub = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=10)
-        if not self._dry_run:
-            t0 = time.time()
-            while (
-                self._pub.get_num_connections() == 0
-                and not rospy.is_shutdown()
-                and time.time() - t0 < 5.0
-            ):
-                time.sleep(0.05)
-            if self._pub.get_num_connections() == 0:
-                rospy.logwarn(
-                    "[cmd_vel] 尚无 /cmd_vel 订阅者, 跟手可能无效",
-                )
-        self._rate = rospy.Rate(PUBLISH_RATE_HZ)
-        self._stop_evt = threading.Event()
-
-    def stop(self):
-        self._stop_evt.set()
-
-    def publish_stop_blocking(self, duration: float = 0.5):
-        msg = Twist()
-        end_t = time.time() + duration
-        while time.time() < end_t:
-            if not self._dry_run:
-                self._pub.publish(msg)
-            time.sleep(1.0 / max(PUBLISH_RATE_HZ, 1))
-
-    def run(self):
-        msg = Twist()
-        while not self._stop_evt.is_set() and not rospy.is_shutdown():
-            cx, cy, cz, stale = self._vel.get()
-            fsm_ok = (self._fsm is None) or self._fsm.is_exec_default()
-            if not fsm_ok or stale:
-                cx, cy, cz = 0.0, 0.0, 0.0
-            msg.linear.x = cx
-            msg.linear.y = cy
-            msg.linear.z = 0.0
-            msg.angular.x = 0.0
-            msg.angular.y = 0.0
-            msg.angular.z = cz
-            if not self._dry_run:
                 self._pub.publish(msg)
             self._rate.sleep()

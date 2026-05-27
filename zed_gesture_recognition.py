@@ -30,14 +30,14 @@ except ImportError as exc:
 from colorama import Fore, Style, init
 
 from gesture_actions import (
-    GESTURE_HEAD_NOD,
+    GESTURE_ACTION_HOLD_SEC,
     GESTURE_ZERO_EXIT_SEC,
     GESTURE_ZERO_LABEL,
+    GestureActionHold,
     GestureZeroHandler,
     action_hint_for_gesture,
     emit_status_line,
     log_gesture_action_edge,
-    log_gesture_head_nod,
     log_gesture_zero_estop,
     log_gesture_zero_exit,
 )
@@ -393,7 +393,9 @@ def main():
     )
 
     last_logged_gesture = -1
+    last_logged_confirmed = -1
     zero_handler = GestureZeroHandler(exit_hold_sec=args.zero_exit_sec)
+    action_hold = GestureActionHold(hold_sec=GESTURE_ACTION_HOLD_SEC)
 
     try:
         while True:
@@ -542,19 +544,19 @@ def main():
                 log_gesture_zero_exit(zero_hold)
                 break
 
-            if gesture != 0 and gesture != last_logged_gesture:
-                if gesture == GESTURE_HEAD_NOD:
-                    if has_hand and in_range:
-                        log_gesture_head_nod(dry_run=True)
-                else:
-                    log_gesture_action_edge(
-                        gesture,
-                        last_logged_gesture,
-                        in_range=in_range,
-                        has_hand=has_hand,
-                        preview_only=True,
-                    )
+            confirmed = action_hold.update(
+                gesture, has_hand=has_hand, in_range=in_range,
+            )
+            if confirmed >= 0 and confirmed != last_logged_confirmed:
+                log_gesture_action_edge(
+                    confirmed,
+                    last_logged_confirmed,
+                    in_range=in_range,
+                    has_hand=has_hand,
+                    preview_only=True,
+                )
             last_logged_gesture = gesture
+            last_logged_confirmed = confirmed if confirmed >= 0 else -1
 
             print_terminal_log(
                 gesture, distance, direction,

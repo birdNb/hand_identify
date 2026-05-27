@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 统一启动：手势跟手 + 默认脸部跟踪(locate_face) + 识别到手抬头反馈
+# 统一启动：脸跟踪常开 + 手势2~4动作库（手势1抬头/五指跟手已禁用）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
