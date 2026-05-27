@@ -18,7 +18,7 @@ import numpy as np
 import rospy
 from sensor_msgs.msg import JointState
 
-from gesture_actions import GESTURE_FACE_TRACK, log_face_track_toggle
+from gesture_actions import GESTURE_FACE_TRACK_LABEL
 
 # ----- 与 locate_face.py 对齐 -----
 ABSOLUTE_TOPIC = "/pi_plus_absolute"
@@ -43,7 +43,10 @@ PUBLISH_RATE_HZ = 50
 NO_FACE_RETURN_HOME_SEC = 1.0
 RETURN_HOME_RATE_DEG_PER_SEC = 45.0
 
-TOGGLE_COOLDOWN_SEC = 1.0
+# ----- 性能：降频视觉推理，减少双模型与 ROI 开销 -----
+FACE_MESH_INTERVAL = 2
+ROI_FALLBACK_INTERVAL = 8
+FACE_TRACK_GRACE_SEC = 1.2
 
 
 def _clamp(x, lo, hi):
@@ -137,11 +140,18 @@ class _NeckTarget:
 class _FaceNeckPublisher(threading.Thread):
     """固定频率发布脖子目标到 /pi_plus_absolute。"""
 
-    def __init__(self, target: _NeckTarget, fsm, dry_run: bool):
+    def __init__(
+        self,
+        target: _NeckTarget,
+        fsm,
+        dry_run: bool,
+        neck_output_enabled,
+    ):
         super().__init__(daemon=True)
         self._target = target
         self._fsm = fsm
         self._dry_run = dry_run
+        self._neck_output_enabled = neck_output_enabled
         self._stop_evt = threading.Event()
         self._pub = rospy.Publisher(ABSOLUTE_TOPIC, JointState, queue_size=10)
         self._rate = rospy.Rate(PUBLISH_RATE_HZ)
@@ -171,6 +181,9 @@ class _FaceNeckPublisher(threading.Thread):
             if self._fsm is not None and not self._fsm.is_exec_default():
                 self._rate.sleep()
                 continue
+            if not self._neck_output_enabled():
+                self._rate.sleep()
+                continue
             yaw, pitch = self._target.get()
             msg.position = [yaw, pitch]
             msg.header.stamp = rospy.Time.now()
@@ -188,23 +201,23 @@ class FaceOverlay:
 
 
 class IntegratedFaceTracker:
-    """
-    与 ZedHandTracker 共用 proc RGB；手势 1 开关；默认可由 hand_follow 自动开启。
-    """
+    """与 ZedHandTracker 共用 proc RGB；人脸检测常开；脖子输出可临时切断(手势1)。"""
 
     def __init__(
         self,
         fsm,
         *,
         dry_run: bool = False,
-        cooldown_sec: float = TOGGLE_COOLDOWN_SEC,
+        mesh_interval: int = FACE_MESH_INTERVAL,
+        roi_interval: int = ROI_FALLBACK_INTERVAL,
     ):
         self._fsm = fsm
         self._dry_run = dry_run
-        self._cooldown_sec = max(0.2, float(cooldown_sec))
-        self._enabled = False
-        self._last_gesture = -1
-        self._last_toggle_t = 0.0
+        self._mesh_interval = max(1, int(mesh_interval))
+        self._roi_interval = max(2, int(roi_interval))
+        self._enabled = True
+        self._neck_output_enabled = True
+        self._neck_lock = threading.Lock()
 
         self._target = _NeckTarget()
         self._ctrl_state: Dict[str, float] = {"yaw_rad": 0.0, "pitch_rad": 0.0}
@@ -213,6 +226,8 @@ class IntegratedFaceTracker:
         self._homing_logged = False
         self._frame_i = 0
         self._overlay = FaceOverlay()
+        self._cached_dx: Optional[float] = None
+        self._cached_dy: Optional[float] = None
         self._mp_face_mesh = mp.solutions.face_mesh
         self._face_mesh = self._mp_face_mesh.FaceMesh(
             max_num_faces=1,
@@ -220,20 +235,23 @@ class IntegratedFaceTracker:
             min_detection_confidence=DETECT_CONFIDENCE,
             min_tracking_confidence=TRACK_CONFIDENCE,
         )
-        self._face_mesh_roi = self._mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=False,
-            min_detection_confidence=DETECT_CONFIDENCE,
-            min_tracking_confidence=TRACK_CONFIDENCE,
-        )
         self._face_detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=1,
+            model_selection=0,
             min_detection_confidence=DETECT_CONFIDENCE,
         )
-        self._publisher = _FaceNeckPublisher(self._target, fsm, dry_run)
+        self._publisher = _FaceNeckPublisher(
+            self._target,
+            fsm,
+            dry_run,
+            self.is_neck_output_enabled,
+        )
         self._publisher.start()
         rospy.loginfo(
-            "[face_track] 内嵌脸跟踪(共用ZED RGB), dry_run=%s", dry_run,
+            "[face_track] %s 常开 mesh/%df roi/%df, dry_run=%s",
+            GESTURE_FACE_TRACK_LABEL,
+            self._mesh_interval,
+            self._roi_interval,
+            dry_run,
         )
 
     @property
@@ -244,63 +262,107 @@ class IntegratedFaceTracker:
     def overlay(self) -> FaceOverlay:
         return self._overlay
 
+    def is_neck_output_enabled(self) -> bool:
+        with self._neck_lock:
+            return self._neck_output_enabled
+
+    def set_neck_output_enabled(self, enabled: bool) -> None:
+        with self._neck_lock:
+            prev = self._neck_output_enabled
+            self._neck_output_enabled = bool(enabled)
+        if prev and not enabled:
+            rospy.loginfo_throttle(
+                1.0, "[face_track] 脸跟踪脖子输出已暂停(手势1点头)",
+            )
+        elif not prev and enabled:
+            rospy.loginfo_throttle(
+                1.0, "[face_track] 脸跟踪脖子输出已恢复",
+            )
+
+    def get_neck_target(self) -> Tuple[float, float]:
+        """当前脸跟踪脖子目标 (yaw_rad, pitch_rad)。"""
+        return self._target.get()
+
     def start(self) -> bool:
-        if self._enabled:
-            return False
+        """兼容启动接口；检测常开，仅重置计时。"""
         self._enabled = True
         self._last_face_t = time.time()
         self._homing_logged = False
-        if not self._dry_run:
-            log_face_track_toggle(enabled=True, dry_run=False)
-        else:
-            log_face_track_toggle(enabled=True, dry_run=True)
-        rospy.loginfo("[face_track] 脸部跟踪已开启 (共用相机RGB)")
         return True
 
-    def stop(self, *, reason: str = "关闭") -> bool:
-        if not self._enabled:
-            return False
-        self._enabled = False
-        self._target.set(0.0, 0.0)
-        self._ctrl_state = {"yaw_rad": 0.0, "pitch_rad": 0.0}
-        if not self._dry_run:
-            self._publisher.publish_center_blocking(0.35)
-        log_face_track_toggle(
-            enabled=False, dry_run=self._dry_run, reason=reason,
-        )
-        rospy.loginfo("[face_track] 脸部跟踪已关闭 (%s)", reason)
-        return True
-
-    def toggle(self) -> bool:
-        if self._enabled:
-            self.stop(reason="手势1")
-            return True
-        return self.start()
-
-    def update(
+    def _apply_face_error(
         self,
-        gesture: int,
+        dx_n: float,
+        dy_n: float,
+        loop_now: float,
+        frame_bgr,
+        proc_w: int,
+        proc_h: int,
         *,
-        has_hand: bool,
-        in_range: bool,
-        joy_blocking: bool = False,
-        fsm_ok: bool = True,
-    ) -> bool:
-        prev = self._last_gesture
-        self._last_gesture = gesture
-        if joy_blocking or not fsm_ok:
-            return False
-        if not has_hand or not in_range:
-            return False
-        if gesture != GESTURE_FACE_TRACK:
-            return False
-        if gesture == prev:
-            return False
-        if time.time() - self._last_toggle_t < self._cooldown_sec:
-            return False
-        self._last_toggle_t = time.time()
-        self.toggle()
-        return True
+        used_roi: bool = False,
+    ) -> FaceOverlay:
+        h, w = frame_bgr.shape[:2]
+        cx_img, cy_img = w / 2.0, h / 2.0
+        face_cx = cx_img + dx_n * (w / 2.0)
+        face_cy = cy_img + dy_n * (h / 2.0)
+        pad = 12
+        fx1 = int(max(0, face_cx - pad))
+        fy1 = int(max(0, face_cy - pad))
+        fx2 = int(min(w - 1, face_cx + pad))
+        fy2 = int(min(h - 1, face_cy + pad))
+
+        cur_yaw, cur_pitch = self._target.get()
+        new_yaw, new_pitch = _update_target_from_error(
+            cur_yaw, cur_pitch, dx_n, dy_n, self._ctrl_state,
+        )
+        if not self._dry_run and self.is_neck_output_enabled():
+            self._target.set(new_yaw, new_pitch)
+        self._last_face_t = loop_now
+        self._homing_logged = False
+
+        overlay = FaceOverlay(
+            has_face=True,
+            used_roi=used_roi,
+            bbox=(fx1, fy1, fx2, fy2),
+            center=(int(face_cx), int(face_cy)),
+        )
+        self._overlay = overlay
+        return overlay
+
+    def _apply_no_face(self, loop_now: float, dt_frame: float) -> FaceOverlay:
+        overlay = FaceOverlay()
+        lost_dur = loop_now - self._last_face_t
+        if (
+            NO_FACE_RETURN_HOME_SEC > 0
+            and lost_dur > NO_FACE_RETURN_HOME_SEC
+        ):
+            cur_yaw, cur_pitch = self._target.get()
+            step_rad = math.radians(
+                RETURN_HOME_RATE_DEG_PER_SEC * dt_frame,
+            )
+            new_yaw = (
+                cur_yaw - math.copysign(min(step_rad, abs(cur_yaw)), cur_yaw)
+                if abs(cur_yaw) > 1e-4 else 0.0
+            )
+            new_pitch = (
+                cur_pitch - math.copysign(
+                    min(step_rad, abs(cur_pitch)), cur_pitch,
+                )
+                if abs(cur_pitch) > 1e-4 else 0.0
+            )
+            if not self._dry_run and self.is_neck_output_enabled():
+                self._target.set(new_yaw, new_pitch)
+            self._ctrl_state["yaw_rad"] = new_yaw
+            self._ctrl_state["pitch_rad"] = new_pitch
+            if not self._homing_logged:
+                rospy.loginfo_throttle(
+                    5.0,
+                    "[face_track] 无人脸 %.1fs, 平滑回中",
+                    lost_dur,
+                )
+                self._homing_logged = True
+        self._overlay = overlay
+        return overlay
 
     def process_shared_rgb(
         self,
@@ -310,20 +372,36 @@ class IntegratedFaceTracker:
         proc_h: int,
     ) -> FaceOverlay:
         """在手势 MediaPipe 之前/之后调用，rgb_mp 与手部检测共用。"""
-        overlay = FaceOverlay()
         if not self._enabled:
-            self._overlay = overlay
-            return overlay
+            self._overlay = FaceOverlay()
+            return self._overlay
 
         if self._fsm is not None and not self._fsm.is_exec_default():
-            self._overlay = overlay
-            return overlay
+            self._overlay = FaceOverlay()
+            return self._overlay
 
         loop_now = time.time()
         dt_frame = max(1e-3, min(0.2, loop_now - self._last_loop_t))
         self._last_loop_t = loop_now
+        self._frame_i += 1
 
-        h, w = frame_bgr.shape[:2]
+        run_mesh = (
+            self._frame_i % self._mesh_interval == 0
+            or not self._overlay.has_face
+        )
+        if not run_mesh:
+            if self._cached_dx is not None:
+                return self._apply_face_error(
+                    self._cached_dx,
+                    self._cached_dy,
+                    loop_now,
+                    frame_bgr,
+                    proc_w,
+                    proc_h,
+                    used_roi=self._overlay.used_roi,
+                )
+            return self._apply_no_face(loop_now, dt_frame)
+
         rgb_in = rgb_mp
         if not rgb_mp.flags["C_CONTIGUOUS"]:
             rgb_in = np.ascontiguousarray(rgb_mp)
@@ -331,9 +409,14 @@ class IntegratedFaceTracker:
         res = self._face_mesh.process(rgb_in)
         used_roi = False
 
-        self._frame_i += 1
-        # ROI 兜底较重，每 3 帧跑一次，减轻 CPU 卡顿
-        if not res.multi_face_landmarks and (self._frame_i % 3 == 0):
+        recently_tracked = (
+            loop_now - self._last_face_t
+        ) < FACE_TRACK_GRACE_SEC
+        if (
+            not res.multi_face_landmarks
+            and not recently_tracked
+            and self._frame_i % self._roi_interval == 0
+        ):
             bbox = _detect_face_roi_bbox(
                 self._face_detector, rgb_in, proc_w, proc_h,
             )
@@ -341,7 +424,7 @@ class IntegratedFaceTracker:
                 x1, y1, x2, y2 = bbox
                 roi = np.ascontiguousarray(rgb_in[y1:y2, x1:x2])
                 if roi.size > 0 and roi.shape[0] >= 20 and roi.shape[1] >= 20:
-                    res2 = self._face_mesh_roi.process(roi)
+                    res2 = self._face_mesh.process(roi)
                 else:
                     res2 = None
                 if res2 is not None and res2.multi_face_landmarks:
@@ -354,71 +437,30 @@ class IntegratedFaceTracker:
                     res = res2
                     used_roi = True
 
+        h, w = frame_bgr.shape[:2]
         cx_img, cy_img = w / 2.0, h / 2.0
-        scale_x = w / max(proc_w, 1)
-        scale_y = h / max(proc_h, 1)
 
         if res.multi_face_landmarks:
             lm = res.multi_face_landmarks[0]
             px1, py1, px2, py2 = _face_bbox_from_landmarks(
                 lm, proc_w, proc_h, pad=12,
             )
-            fx1 = int(px1 * scale_x)
-            fy1 = int(py1 * scale_y)
-            fx2 = int(px2 * scale_x)
-            fy2 = int(py2 * scale_y)
-            face_cx = (fx1 + fx2) / 2.0
-            face_cy = (fy1 + fy2) / 2.0
+            scale_x = w / max(proc_w, 1)
+            scale_y = h / max(proc_h, 1)
+            face_cx = (px1 + px2) / 2.0 * scale_x
+            face_cy = (py1 + py2) / 2.0 * scale_y
             dx_n = (face_cx - cx_img) / (w / 2.0)
             dy_n = (face_cy - cy_img) / (h / 2.0)
-
-            cur_yaw, cur_pitch = self._target.get()
-            new_yaw, new_pitch = _update_target_from_error(
-                cur_yaw, cur_pitch, dx_n, dy_n, self._ctrl_state,
+            self._cached_dx = dx_n
+            self._cached_dy = dy_n
+            return self._apply_face_error(
+                dx_n, dy_n, loop_now, frame_bgr, proc_w, proc_h,
+                used_roi=used_roi,
             )
-            if not self._dry_run:
-                self._target.set(new_yaw, new_pitch)
-            self._last_face_t = loop_now
-            self._homing_logged = False
 
-            overlay.has_face = True
-            overlay.used_roi = used_roi
-            overlay.bbox = (fx1, fy1, fx2, fy2)
-            overlay.center = (int(face_cx), int(face_cy))
-        else:
-            lost_dur = loop_now - self._last_face_t
-            if (
-                NO_FACE_RETURN_HOME_SEC > 0
-                and lost_dur > NO_FACE_RETURN_HOME_SEC
-            ):
-                cur_yaw, cur_pitch = self._target.get()
-                step_rad = math.radians(
-                    RETURN_HOME_RATE_DEG_PER_SEC * dt_frame,
-                )
-                new_yaw = (
-                    cur_yaw - math.copysign(min(step_rad, abs(cur_yaw)), cur_yaw)
-                    if abs(cur_yaw) > 1e-4 else 0.0
-                )
-                new_pitch = (
-                    cur_pitch - math.copysign(
-                        min(step_rad, abs(cur_pitch)), cur_pitch,
-                    )
-                    if abs(cur_pitch) > 1e-4 else 0.0
-                )
-                if not self._dry_run:
-                    self._target.set(new_yaw, new_pitch)
-                self._ctrl_state["yaw_rad"] = new_yaw
-                self._ctrl_state["pitch_rad"] = new_pitch
-                if not self._homing_logged:
-                    rospy.loginfo_throttle(
-                        5.0,
-                        "[face_track] 无人脸 %.1fs, 平滑回中",
-                        lost_dur,
-                    )
-                    self._homing_logged = True
-
-        self._overlay = overlay
-        return overlay
+        self._cached_dx = None
+        self._cached_dy = None
+        return self._apply_no_face(loop_now, dt_frame)
 
     def draw_overlay(self, frame_bgr) -> None:
         ov = self._overlay
@@ -436,12 +478,14 @@ class IntegratedFaceTracker:
             )
 
     def shutdown(self):
-        self.stop(reason="程序退出")
+        self._enabled = False
+        self.set_neck_output_enabled(False)
+        self._target.set(0.0, 0.0)
+        if not self._dry_run:
+            self._publisher.publish_center_blocking(0.35)
         self._publisher.stop()
         self._face_mesh.close()
-        self._face_mesh_roi.close()
         self._face_detector.close()
 
 
-# 兼容旧导入名
 FaceTrackingLauncher = IntegratedFaceTracker

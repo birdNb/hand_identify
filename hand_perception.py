@@ -21,13 +21,14 @@ import mediapipe as mp
 import numpy as np
 
 from gesture_actions import (
-    GESTURE_FACE_TRACK,
+    GESTURE_HEAD_NOD,
     GESTURE_ZERO_EXIT_SEC,
     GESTURE_ZERO_LABEL,
     GestureZeroHandler,
     action_hint_for_gesture,
     emit_status_line,
     log_gesture_action_edge,
+    log_gesture_head_nod,
     log_gesture_zero_estop,
     log_gesture_zero_exit,
 )
@@ -41,8 +42,9 @@ except ImportError as exc:
 
 # ----- 默认参数 -----
 TARGET_FPS = 30
-PROC_MAX_W = 960
-USE_HD1080 = True
+PROC_MAX_W = 640
+USE_HD1080 = False
+LITE_DISPLAY = True
 DIST_MIN_M = 0.2
 DIST_MAX_M = 2.0
 GESTURE_SMOOTH_FRAMES = 5
@@ -263,7 +265,7 @@ def open_zed_camera(use_hd1080=True, dist_min=DIST_MIN_M, dist_max=DIST_MAX_M):
         sl.RESOLUTION.HD1080 if use_hd1080 else sl.RESOLUTION.HD720
     )
     init_params.camera_fps = TARGET_FPS
-    init_params.depth_mode = sl.DEPTH_MODE.QUALITY
+    init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
     init_params.coordinate_units = sl.UNIT.METER
     init_params.depth_minimum_distance = dist_min
     init_params.depth_maximum_distance = dist_max
@@ -349,10 +351,12 @@ class ZedHandTracker:
         use_hd1080=USE_HD1080,
         proc_max_w=PROC_MAX_W,
         move_threshold=MOVEMENT_THRESHOLD_M,
+        lite_display=LITE_DISPLAY,
     ):
         self.dist_min = dist_min
         self.dist_max = dist_max
         self.proc_max_w = max(320, proc_max_w)
+        self.lite_display = lite_display
         self.zed = open_zed_camera(
             use_hd1080=use_hd1080,
             dist_min=dist_min,
@@ -365,8 +369,8 @@ class ZedHandTracker:
             min_tracking_confidence=0.5,
         )
         self._image = sl.Mat()
-        self._depth_map = sl.Mat()
         self._point_cloud = sl.Mat()
+        self._point_cloud_ready = False
         self._runtime = sl.RuntimeParameters()
         self._runtime.confidence_threshold = 50
         self._smoother = GestureSmoother()
@@ -391,8 +395,7 @@ class ZedHandTracker:
             return np.zeros((self.img_h, self.img_w, 3), dtype=np.uint8), obs
 
         self.zed.retrieve_image(self._image, sl.VIEW.LEFT)
-        self.zed.retrieve_measure(self._depth_map, sl.MEASURE.DEPTH)
-        self.zed.retrieve_measure(self._point_cloud, sl.MEASURE.XYZ)
+        self._point_cloud_ready = False
 
         frame = self._image.get_data()
         if frame is None:
@@ -403,10 +406,20 @@ class ZedHandTracker:
         cx_img = img_w / 2.0
 
         proc_w, proc_h = compute_proc_size(img_w, img_h, self.proc_max_w)
+        use_lite = (
+            self.lite_display
+            and (proc_w, proc_h) != (img_w, img_h)
+        )
         if (proc_w, proc_h) != (img_w, img_h):
-            proc_bgr = cv2.resize(frame, (proc_w, proc_h))
+            proc_bgr = cv2.resize(
+                frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA,
+            )
         else:
             proc_bgr = frame
+        display_bgr = proc_bgr if use_lite else frame
+        disp_sx = proc_w / max(img_w, 1) if use_lite else 1.0
+        disp_sy = proc_h / max(img_h, 1) if use_lite else 1.0
+
         # 手部 + 脸部 MediaPipe 共用同一份降采样 RGB，避免重复 cvtColor/上传
         rgb_mp = cv2.cvtColor(proc_bgr, cv2.COLOR_BGR2RGB)
         if not rgb_mp.flags["C_CONTIGUOUS"]:
@@ -414,23 +427,29 @@ class ZedHandTracker:
         rgb_mp.flags.writeable = False
 
         if face_tracker is not None and face_tracker.is_active:
-            face_tracker.process_shared_rgb(rgb_mp, frame, proc_w, proc_h)
+            face_tracker.process_shared_rgb(
+                rgb_mp, display_bgr, proc_w, proc_h,
+            )
             if draw_landmarks:
-                face_tracker.draw_overlay(frame)
+                face_tracker.draw_overlay(display_bgr)
 
         results = self._hands.process(rgb_mp)
 
         if not results.multi_hand_landmarks:
             self._smoother.reset()
             self._movement.reset()
-            return frame, obs
+            return display_bgr, obs
+
+        if not self._point_cloud_ready:
+            self.zed.retrieve_measure(self._point_cloud, sl.MEASURE.XYZ)
+            self._point_cloud_ready = True
 
         obs.has_hand = True
         handedness_list = results.multi_handedness or []
         for idx, hand_lm in enumerate(results.multi_hand_landmarks):
             if draw_landmarks:
                 mp_drawing.draw_landmarks(
-                    frame, hand_lm, mp_hands.HAND_CONNECTIONS,
+                    display_bgr, hand_lm, mp_hands.HAND_CONNECTIONS,
                     mp_drawing.DrawingSpec(
                         color=(121, 22, 76), thickness=2, circle_radius=4,
                     ),
@@ -454,6 +473,13 @@ class ZedHandTracker:
                     obs.dx_norm = clamp(
                         (palm_px[0] - cx_img) / (img_w / 2.0), -1.0, 1.0,
                     )
+                    if draw_landmarks and use_lite:
+                        px_d = (
+                            int(palm_px[0] * disp_sx),
+                            int(palm_px[1] * disp_sy),
+                        )
+                        col = (0, 255, 0) if obs.in_range else (0, 165, 255)
+                        cv2.circle(display_bgr, px_d, 6, col, -1)
                 if not obs.in_range:
                     hint = distance_range_hint(
                         obs.distance_m, self.dist_min, self.dist_max,
@@ -474,7 +500,7 @@ class ZedHandTracker:
                 obs.direction = self._movement.update(None)
             break
 
-        return frame, obs
+        return display_bgr, obs
 
 
 def main():
@@ -482,7 +508,9 @@ def main():
         description="ZED 手部感知预览（手势 0~5 + 掌心 3D）",
     )
     parser.add_argument("--no-gui", action="store_true", help="不显示 OpenCV 窗口")
-    parser.add_argument("--hd720", action="store_true", help="使用 HD720（默认 HD1080）")
+    parser.add_argument(
+        "--hd1080", action="store_true", help="使用 HD1080（默认 HD720）",
+    )
     parser.add_argument(
         "--proc-max-w", type=int, default=PROC_MAX_W,
         help=f"MediaPipe 最大输入宽度 (默认 {PROC_MAX_W})",
@@ -515,7 +543,7 @@ def main():
     tracker = ZedHandTracker(
         dist_min=args.dist_min,
         dist_max=args.dist_max,
-        use_hd1080=not args.hd720,
+        use_hd1080=args.hd1080,
         proc_max_w=args.proc_max_w,
         move_threshold=args.move_threshold,
     )
@@ -535,12 +563,11 @@ def main():
     )
     print(
         f"{Fore.GREEN}手势动作: 0急停/按住{args.zero_exit_sec:.0f}s退出 "
-        f"1脸跟踪 2抬手 3挥双手 4踢球",
+        f"1抬头20° 2抬手 3挥双手 4踢球",
         flush=True,
     )
 
     last_logged_gesture = -1
-    preview_face_track_on = False
     zero_handler = GestureZeroHandler(exit_hold_sec=args.zero_exit_sec)
     try:
         while True:
@@ -556,17 +583,9 @@ def main():
                 log_gesture_zero_exit(zero_hold)
                 break
             if obs.gesture != 0 and obs.gesture != last_logged_gesture:
-                if obs.gesture == GESTURE_FACE_TRACK:
-                    log_gesture_action_edge(
-                        obs.gesture,
-                        last_logged_gesture,
-                        in_range=obs.in_range,
-                        has_hand=obs.has_hand,
-                        preview_only=True,
-                        face_track_on=preview_face_track_on,
-                    )
+                if obs.gesture == GESTURE_HEAD_NOD:
                     if obs.has_hand and obs.in_range:
-                        preview_face_track_on = not preview_face_track_on
+                        log_gesture_head_nod(dry_run=True)
                 else:
                     log_gesture_action_edge(
                         obs.gesture,
@@ -576,7 +595,7 @@ def main():
                         preview_only=True,
                     )
             last_logged_gesture = obs.gesture
-            print_terminal_log(obs, face_track_on=preview_face_track_on)
+            print_terminal_log(obs)
 
             if not args.no_gui:
                 if zero_estop:

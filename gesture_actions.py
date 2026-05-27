@@ -6,11 +6,13 @@ import time
 from typing import Dict, Optional, Tuple
 
 GESTURE_STOP = 0
-GESTURE_FACE_TRACK = 1
+GESTURE_HEAD_NOD = 1
+GESTURE_FACE_TRACK = GESTURE_HEAD_NOD  # 兼容旧名
 GESTURE_FOLLOW = 5
 GESTURE_ZERO_EXIT_SEC = 5.0
 GESTURE_ZERO_LABEL = "急停/退出"
-GESTURE_FACE_TRACK_LABEL = "脸部跟踪"  # 调用 locate_face/locate_face.py
+GESTURE_HEAD_NOD_LABEL = "抬头20°"
+GESTURE_FACE_TRACK_LABEL = "脸部跟踪(常开)"
 
 # gesture -> (action_name, joy_key_combo, keepalive_sec 已废弃，实际时长见 hand_action_library.ACTION_DURATION_SEC)
 GESTURE_ACTION_SPECS: Dict[int, Tuple[str, str, float]] = {
@@ -50,10 +52,8 @@ def action_hint_for_gesture(gesture: int, *, face_track_on: bool = False) -> str
     """状态行后缀：当前手势对应的动作说明。"""
     if gesture == GESTURE_STOP:
         return GESTURE_ZERO_LABEL
-    if gesture == GESTURE_FACE_TRACK:
-        if face_track_on:
-            return f"{GESTURE_FACE_TRACK_LABEL}:开"
-        return f"{GESTURE_FACE_TRACK_LABEL}:关"
+    if gesture == GESTURE_HEAD_NOD:
+        return GESTURE_HEAD_NOD_LABEL
     if gesture in GESTURE_ACTION_LABELS:
         spec = GESTURE_ACTION_SPECS[gesture]
         return f"动作:{GESTURE_ACTION_LABELS[gesture]}({spec[0]})"
@@ -80,6 +80,20 @@ def format_action_trigger_line(
         )
     mode = "DRY-RUN" if dry_run else "EXEC"
     return f">>> 触发动作: {label} ({name}, {keys}) [{mode}]"
+
+
+def log_gesture_head_nod(*, dry_run: bool = False) -> None:
+    mode = "DRY-RUN" if dry_run else "EXEC"
+    line = f">>> 手势1: {GESTURE_HEAD_NOD_LABEL} 仅pitch (yaw保持) [{mode}]"
+    try:
+        from colorama import Fore
+
+        print(
+            f"\n{Fore.CYAN}[{time.strftime('%H:%M:%S')}] {Fore.YELLOW}{line}",
+            flush=True,
+        )
+    except ImportError:
+        print(f"\n[{time.strftime('%H:%M:%S')}] {line}", flush=True)
 
 
 def log_face_track_toggle(
@@ -113,22 +127,11 @@ def log_gesture_action_edge(
     preview_only: bool = True,
     face_track_on: bool = False,
 ) -> None:
-    """手势切换到 2~4 或 1(脸跟踪) 时单独打日志。"""
+    """手势切换到 2~4 时单独打日志。"""
     import time
 
     if gesture == prev_gesture:
         return
-    if gesture == GESTURE_FACE_TRACK:
-        if not has_hand or not in_range:
-            line = (
-                f">>> 脸部跟踪未切换 [跳过: 无手或超出识别距离]"
-            )
-        else:
-            will_enable = not face_track_on
-            log_face_track_toggle(
-                enabled=will_enable, dry_run=preview_only,
-            )
-            return
     if gesture not in GESTURE_ACTION_LABELS:
         return
     if not has_hand or not in_range:

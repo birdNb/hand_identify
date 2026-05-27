@@ -24,5 +24,5 @@ fi
 
 cd "${SCRIPT_DIR}"
 echo "[start] Bird_ws=${BIRD_WS}"
-echo "[start] 运行 hand_follow_robot (内嵌脸跟踪+共用ZED RGB, 预览加 --preview)"
-exec python3 hand_follow_robot.py "$@"
+echo "[start] 运行 hand_follow_robot (HD720+640px 默认, 预览加 --preview)"
+exec python3 hand_follow_robot.py --fast "$@"

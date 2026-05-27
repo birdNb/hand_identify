@@ -30,14 +30,14 @@ except ImportError as exc:
 from colorama import Fore, Style, init
 
 from gesture_actions import (
-    GESTURE_FACE_TRACK,
+    GESTURE_HEAD_NOD,
     GESTURE_ZERO_EXIT_SEC,
     GESTURE_ZERO_LABEL,
     GestureZeroHandler,
     action_hint_for_gesture,
     emit_status_line,
     log_gesture_action_edge,
-    log_face_track_toggle,
+    log_gesture_head_nod,
     log_gesture_zero_estop,
     log_gesture_zero_exit,
 )
@@ -388,12 +388,11 @@ def main():
         Fore.GREEN
         + "手势动作: 0急停/按住"
         f"{args.zero_exit_sec:.0f}s退出 "
-        + "1脸跟踪开关 2抬手 3挥双手 4踢球; "
-        + "切换手势打印动作/脸跟踪日志",
+        + "1抬头20° 2抬手 3挥双手 4踢球; "
+        + "切换手势打印动作日志",
     )
 
     last_logged_gesture = -1
-    preview_face_track_on = False
     zero_handler = GestureZeroHandler(exit_hold_sec=args.zero_exit_sec)
 
     try:
@@ -544,17 +543,9 @@ def main():
                 break
 
             if gesture != 0 and gesture != last_logged_gesture:
-                if gesture == GESTURE_FACE_TRACK:
-                    log_gesture_action_edge(
-                        gesture,
-                        last_logged_gesture,
-                        in_range=in_range,
-                        has_hand=has_hand,
-                        preview_only=True,
-                        face_track_on=preview_face_track_on,
-                    )
+                if gesture == GESTURE_HEAD_NOD:
                     if has_hand and in_range:
-                        preview_face_track_on = not preview_face_track_on
+                        log_gesture_head_nod(dry_run=True)
                 else:
                     log_gesture_action_edge(
                         gesture,
@@ -568,7 +559,6 @@ def main():
             print_terminal_log(
                 gesture, distance, direction,
                 in_range=in_range, has_hand=has_hand,
-                face_track_on=preview_face_track_on,
             )
 
             if not args.no_gui:

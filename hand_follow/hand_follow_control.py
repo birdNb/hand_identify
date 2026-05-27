@@ -37,9 +37,9 @@ HAND_MOVE_THRESH_M = 0.04
 ABSOLUTE_TOPIC = "/pi_plus_absolute"
 HEAD_YAW_JOINT = "head_yaw_joint"
 HEAD_PITCH_JOINT = "head_pitch_joint"
-HAND_FEEDBACK_PITCH_DEG = -10.0    # 反馈抬头 10° (pitch 负=抬头)
-HAND_FEEDBACK_RAMP_SEC = 1.0       # 1 秒内抬到目标后停止
-NECK_RETURN_RAMP_DEG_PER_SEC = 8.0 # 无手后回中角速度
+GESTURE_NOD_PITCH_DEG = -20.0      # 手势1: 抬头 20° (pitch 负=抬头)
+GESTURE_NOD_RAMP_SEC = 1.0         # 1 秒内抬到目标
+NECK_RETURN_RAMP_DEG_PER_SEC = 8.0 # 复原回中角速度
 NECK_PUBLISH_RATE_HZ = 50
 
 CMD_VALID_SEC = 0.5
@@ -295,35 +295,28 @@ def _step_toward(cur: float, goal: float, max_step: float) -> float:
 
 
 class NeckController(threading.Thread):
-    """
-    识别到手：1 秒内抬头 10°（反馈一次）然后自动回中。
-    - 手一直在画面中也不会重复触发，必须先“丢手”再“重新见手”才会再抬一次
-  与 locate_face 同时运行时勿调用（由 hand_follow 在脸跟踪开启时禁用）。
-    """
+    """手势 1：仅 pitch 抬头 20° 后复原；yaw 保持触发瞬间角度不动。"""
 
     def __init__(
         self,
         fsm: Optional[FsmStateMonitor],
         dry_run: bool,
-        pitch_up_deg: float = HAND_FEEDBACK_PITCH_DEG,
-        feedback_ramp_sec: float = HAND_FEEDBACK_RAMP_SEC,
+        pitch_up_deg: float = GESTURE_NOD_PITCH_DEG,
+        nod_ramp_sec: float = GESTURE_NOD_RAMP_SEC,
         return_ramp_deg_s: float = NECK_RETURN_RAMP_DEG_PER_SEC,
     ):
         super().__init__(daemon=True)
         self._fsm = fsm
         self._dry_run = dry_run
         self._pitch_up_rad = math.radians(pitch_up_deg)
-        self._feedback_ramp_sec = max(0.1, float(feedback_ramp_sec))
-        self._feedback_ramp_rad_s = abs(self._pitch_up_rad) / self._feedback_ramp_sec
+        self._nod_ramp_sec = max(0.1, float(nod_ramp_sec))
+        self._nod_ramp_rad_s = abs(self._pitch_up_rad) / self._nod_ramp_sec
         self._return_ramp_rad_s = math.radians(return_ramp_deg_s)
         self._lock = threading.Lock()
         self._phase = "idle"
-        self._hand_prev = False
-        self._armed = True
-        self._feedback_deadline = 0.0
-        self._goal_yaw = 0.0
+        self._nod_deadline = 0.0
+        self._hold_yaw = 0.0
         self._goal_pitch = 0.0
-        self._cur_yaw = 0.0
         self._cur_pitch = 0.0
         self._stop_evt = threading.Event()
         self._pub = rospy.Publisher(ABSOLUTE_TOPIC, JointState, queue_size=10)
@@ -334,46 +327,39 @@ class NeckController(threading.Thread):
         with self._lock:
             return self._phase
 
-    def update_hand(self, detected: bool):
-        """手出现上升沿触发一次抬头反馈；完成后自动回中。"""
+    @property
+    def is_busy(self) -> bool:
         with self._lock:
-            rising = detected and not self._hand_prev
-            falling = not detected and self._hand_prev
-            self._hand_prev = detected
-            self._goal_yaw = 0.0
+            return self._phase in ("feedback", "return")
 
-            if falling:
-                # 只有真正丢手后才重新武装下一次“抬一次头”
-                self._armed = True
-
-            if rising and self._armed:
-                self._armed = False
-                self._phase = "feedback"
-                self._feedback_deadline = (
-                    time.time() + self._feedback_ramp_sec
-                )
-                self._goal_pitch = self._pitch_up_rad
-            elif self._phase == "return":
-                self._goal_pitch = 0.0
-            elif self._phase == "idle":
-                self._goal_pitch = 0.0
-
-    def set_hand_detected(self, detected: bool):
-        """兼容旧接口。"""
-        self.update_hand(detected)
+    def trigger_gesture_nod(
+        self,
+        hold_yaw_rad: float = 0.0,
+        start_pitch_rad: float = 0.0,
+    ) -> bool:
+        """手势 1：仅 pitch 抬头 20° 再回中；yaw 锁定不变。忙时返回 False。"""
+        with self._lock:
+            if self._phase != "idle":
+                return False
+            self._phase = "feedback"
+            self._nod_deadline = time.time() + self._nod_ramp_sec
+            self._hold_yaw = float(hold_yaw_rad)
+            self._cur_pitch = float(start_pitch_rad)
+            self._goal_pitch = self._pitch_up_rad
+            return True
 
     def stop(self):
         self._stop_evt.set()
 
     def publish_center_blocking(self, duration: float = 0.5):
         with self._lock:
-            self._goal_yaw = 0.0
+            hold_yaw = self._hold_yaw
             self._goal_pitch = 0.0
-            self._cur_yaw = 0.0
             self._cur_pitch = 0.0
+            self._phase = "idle"
         msg = JointState()
         msg.name = [HEAD_YAW_JOINT, HEAD_PITCH_JOINT]
-        msg.position = [0.0, 0.0]
+        msg.position = [hold_yaw, 0.0]
         msg.velocity = []
         msg.effort = []
         end_t = time.time() + duration
@@ -398,33 +384,29 @@ class NeckController(threading.Thread):
                 phase = self._phase
                 goal_pitch = self._goal_pitch
                 if phase == "feedback":
-                    ramp_step = self._feedback_ramp_rad_s * dt
+                    ramp_step = self._nod_ramp_rad_s * dt
                 elif phase == "return":
                     ramp_step = self._return_ramp_rad_s * dt
                 else:
-                    ramp_step = self._return_ramp_rad_s * dt
+                    ramp_step = 0.0
 
-                self._cur_yaw = _step_toward(
-                    self._cur_yaw, self._goal_yaw, ramp_step,
-                )
-                self._cur_pitch = _step_toward(
-                    self._cur_pitch, goal_pitch, ramp_step,
-                )
+                if phase != "idle":
+                    self._cur_pitch = _step_toward(
+                        self._cur_pitch, goal_pitch, ramp_step,
+                    )
                 if phase == "feedback":
                     reached = abs(self._cur_pitch - goal_pitch) <= pitch_eps
-                    if reached or time.time() >= self._feedback_deadline:
-                        # 反馈完成后立刻回中，避免与脸跟踪争抢导致抖动
+                    if reached or time.time() >= self._nod_deadline:
                         self._phase = "return"
                         self._goal_pitch = 0.0
                 elif phase == "return":
                     if abs(self._cur_pitch) <= pitch_eps and abs(goal_pitch) < 1e-6:
                         self._phase = "idle"
-                        self._cur_yaw = 0.0
-                        self._cur_pitch = 0.0
-                yaw, pitch = self._cur_yaw, self._cur_pitch
-            msg.position = [yaw, pitch]
-            msg.header.stamp = rospy.Time.now()
-            if not self._dry_run:
+                yaw = self._hold_yaw
+                pitch = self._cur_pitch
+            if phase != "idle" and not self._dry_run:
+                msg.position = [yaw, pitch]
+                msg.header.stamp = rospy.Time.now()
                 self._pub.publish(msg)
             self._rate.sleep()
 
