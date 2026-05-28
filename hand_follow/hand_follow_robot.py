@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# hand_follow_robot.py — 脸跟踪常开 + 手势 2~4 动作库
+# hand_follow_robot.py — 脸跟踪常开 + 手势 1~4 动作
 #
 # 手势 0: 急停+中止动作；按住 5s 退出程序
-# 手势 1: 单指抬头已禁用（避免与脸跟踪抢 /pi_plus_absolute）
+# 手势 1: 腰部撒娇（wing_wist，±45° 来回 2 次 + 挥双手）
 # 手势 2~4: 抬手 / 挥动双手 / 踢球（/joy_msg 动作库）
 # 手柄 /joy 有输入时：停手势动作库，脸跟踪保持
 # 手势 5 五指跟手: 已禁用，备份见 5_finger_locomotion.py
@@ -36,6 +36,8 @@ from gesture_actions import (
     GESTURE_ACTION_HOLD_SEC,
     GESTURE_ACTION_SPECS,
     GESTURE_FACE_TRACK_LABEL,
+    GESTURE_HEAD_NOD,
+    GESTURE_HOLD_GESTURES,
     GESTURE_STOP,
     GESTURE_ZERO_EXIT_SEC,
     GestureActionHold,
@@ -46,12 +48,13 @@ from gesture_actions import (
 from hand_action_library import GestureActionPlayer
 from face_tracker import IntegratedFaceTracker
 from hand_follow_control import FsmStateMonitor, JoyMonitor, JOY_IDLE_SEC
+from waist_coquette_player import WaistCoquettePlayer
 
 FULLSCREEN = True
 WINDOW_NAME = "Hand Follow"
 
 # OpenCV 默认字体无法显示中文，GUI 仅用 ASCII
-GESTURE_UI_EN = {2: "hello", 3: "cheer", 4: "kick"}
+GESTURE_UI_EN = {1: "coquette", 2: "hello", 3: "cheer", 4: "kick"}
 
 
 def draw_text(frame, text, pos, color=(0, 255, 0), scale=0.6, thick=2):
@@ -63,7 +66,7 @@ def draw_text(frame, text, pos, color=(0, 255, 0), scale=0.6, thick=2):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="手势识别 + 脸跟踪(常开) + 动作库",
+        description="手势识别 + 脸跟踪(常开) + 手势1撒娇/2~4动作库",
     )
     parser.add_argument(
         "--preview", action="store_true",
@@ -78,7 +81,11 @@ def main():
     parser.add_argument("--no-joy", action="store_true")
     parser.add_argument(
         "--no-actions", action="store_true",
-        help="禁用手势 2~4 动作库触发",
+        help="禁用手势 1 撒娇与 2~4 动作库",
+    )
+    parser.add_argument(
+        "--no-coquette", action="store_true",
+        help="禁用手势 1 腰部撒娇",
     )
     parser.add_argument(
         "--no-face-track", action="store_true",
@@ -101,7 +108,7 @@ def main():
     )
     parser.add_argument(
         "--gesture-hold-sec", type=float, default=GESTURE_ACTION_HOLD_SEC,
-        help="手势2~4连续稳定多少秒后触发动作 (默认 2)",
+        help="手势1~4连续稳定多少秒后触发动作 (默认 2)",
     )
     args = parser.parse_args()
     if args.fast:
@@ -123,8 +130,11 @@ def main():
     joy = None if args.no_joy else JoyMonitor()
 
     action_player = None
+    coquette_player = None
     if not args.no_actions:
         action_player = GestureActionPlayer(dry_run=dry_run)
+    if not args.no_actions and not args.no_coquette:
+        coquette_player = WaistCoquettePlayer(dry_run=dry_run)
 
     face_track = None
     if not args.no_face_track:
@@ -144,14 +154,18 @@ def main():
     face_hint = "关" if args.no_face_track else "常开"
     action_hint = (
         "关" if args.no_actions
-        else "2抬手 3挥双手 4踢球"
+        else (
+            "2抬手 3挥双手 4踢球"
+            if args.no_coquette
+            else "1撒娇 2抬手 3挥双手 4踢球"
+        )
     )
     zero_handler = GestureZeroHandler(exit_hold_sec=args.zero_exit_sec)
     action_hold = GestureActionHold(hold_sec=args.gesture_hold_sec)
     if dry_run:
         rospy.logwarn("[hand_follow] 预览模式 (--preview)")
     rospy.loginfo(
-        "[hand_follow] 脸跟踪=%s | 动作库=%s(稳定%.1fs) | 手势1抬头=关 | "
+        "[hand_follow] 脸跟踪=%s | 动作=%s(稳定%.1fs) | "
         "手势0按住%.0fs退出 | %s | %s",
         face_hint,
         action_hint,
@@ -183,6 +197,8 @@ def main():
     def _release_gesture_control_to_joy():
         if action_player is not None and action_player.is_busy:
             action_player.abort()
+        if coquette_player is not None and coquette_player.is_busy:
+            coquette_player.abort()
 
     try:
         while not rospy.is_shutdown():
@@ -208,6 +224,8 @@ def main():
                     rospy.logwarn("[hand_follow] 手势0急停")
                 if action_player is not None:
                     action_player.abort()
+                if coquette_player is not None:
+                    coquette_player.abort()
                 action_hold.reset()
             if zero_exit:
                 log_gesture_zero_exit(zero_hold)
@@ -223,7 +241,8 @@ def main():
             )
             if joy is not None:
                 need_release = (
-                    action_player is not None and action_player.is_busy
+                    (action_player is not None and action_player.is_busy)
+                    or (coquette_player is not None and coquette_player.is_busy)
                 )
                 if joy.poll_takeover_edge():
                     if need_release:
@@ -237,12 +256,28 @@ def main():
             face_track_on = face_track is not None and face_track.is_active
 
             confirmed_action_g = -1
-            if action_player is not None and obs.gesture != GESTURE_STOP:
+            action_fired = False
+            coquette_fired = False
+            if obs.gesture != GESTURE_STOP:
                 confirmed_action_g = action_hold.update(
                     obs.gesture,
                     has_hand=obs.has_hand,
                     in_range=obs.in_range,
                 )
+            if confirmed_action_g == GESTURE_HEAD_NOD and coquette_player is not None:
+                coquette_fired = coquette_player.update(
+                    confirmed_action_g,
+                    has_hand=obs.has_hand,
+                    in_range=obs.in_range,
+                    joy_blocking=joy_blocking,
+                    fsm_ok=fsm_ok,
+                    other_busy=action_player is not None and action_player.is_busy,
+                )
+            elif (
+                action_player is not None
+                and confirmed_action_g in GESTURE_ACTION_SPECS
+                and not (coquette_player is not None and coquette_player.is_busy)
+            ):
                 action_fired = action_player.update(
                     confirmed_action_g,
                     has_hand=obs.has_hand,
@@ -250,8 +285,6 @@ def main():
                     joy_blocking=joy_blocking,
                     fsm_ok=fsm_ok,
                 )
-            else:
-                action_fired = False
 
             if obs.palm_px is not None and not tracker.lite_display:
                 col = (0, 255, 0) if obs.in_range else (0, 165, 255)
@@ -290,6 +323,13 @@ def main():
                 else:
                     face_txt = "FACE search..."
                 draw_text(frame, face_txt, (10, 120), (0, 255, 128), 0.75, 2)
+            elif coquette_player is not None and (
+                coquette_fired or coquette_player.is_busy
+            ):
+                draw_text(
+                    frame, "ACT: coquette",
+                    (10, 120), (255, 128, 200), 0.75, 2,
+                )
             elif action_player is not None and (
                 action_fired or action_player.is_busy
             ):
@@ -305,7 +345,7 @@ def main():
             elif (
                 obs.has_hand
                 and obs.in_range
-                and obs.gesture in GESTURE_ACTION_SPECS
+                and obs.gesture in GESTURE_HOLD_GESTURES
                 and action_hold.progress < 1.0
             ):
                 remain = action_hold.hold_remaining
@@ -319,7 +359,7 @@ def main():
                 if obs.has_hand and obs.in_range and obs.gesture in GESTURE_UI_EN:
                     hint = f"G{obs.gesture} {GESTURE_UI_EN[obs.gesture]}"
                 elif obs.has_hand:
-                    hint = "G0 estop G2-4 act | face on"
+                    hint = "G0 estop G1-4 act | face on"
                 else:
                     hint = "no hand"
                 draw_text(frame, hint, (10, 120), (128, 128, 128), 0.7, 2)

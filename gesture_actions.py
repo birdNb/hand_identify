@@ -11,8 +11,11 @@ GESTURE_FACE_TRACK = GESTURE_HEAD_NOD  # 兼容旧名
 GESTURE_FOLLOW = 5
 GESTURE_ZERO_EXIT_SEC = 5.0
 GESTURE_ZERO_LABEL = "急停/退出"
-GESTURE_HEAD_NOD_LABEL = "抬头20°"
+GESTURE_HEAD_NOD_LABEL = "腰部撒娇"
 GESTURE_FACE_TRACK_LABEL = "脸部跟踪(常开)"
+
+# 需稳定 hold 后才触发的手势（含 1 撒娇、2~4 动作库）
+GESTURE_HOLD_GESTURES = frozenset({1, 2, 3, 4})
 
 # gesture -> (action_name, joy_key_combo, keepalive_sec 已废弃，实际时长见 hand_action_library.ACTION_DURATION_SEC)
 GESTURE_ACTION_SPECS: Dict[int, Tuple[str, str, float]] = {
@@ -55,7 +58,7 @@ def action_hint_for_gesture(gesture: int, *, face_track_on: bool = False) -> str
     if gesture == GESTURE_STOP:
         return GESTURE_ZERO_LABEL
     if gesture == GESTURE_HEAD_NOD:
-        return "单指抬头(已禁用)"
+        return GESTURE_HEAD_NOD_LABEL
     if gesture in GESTURE_ACTION_LABELS:
         spec = GESTURE_ACTION_SPECS[gesture]
         return f"动作:{GESTURE_ACTION_LABELS[gesture]}({spec[0]})"
@@ -86,7 +89,7 @@ def format_action_trigger_line(
 
 def log_gesture_head_nod(*, dry_run: bool = False) -> None:
     mode = "DRY-RUN" if dry_run else "EXEC"
-    line = f">>> 手势1: {GESTURE_HEAD_NOD_LABEL} 仅pitch (yaw保持) [{mode}]"
+    line = f">>> 手势1: {GESTURE_HEAD_NOD_LABEL} [{mode}]"
     try:
         from colorama import Fore
 
@@ -196,7 +199,7 @@ class GestureActionHold:
         if not has_hand or not in_range:
             self.reset()
             return -1
-        if gesture not in GESTURE_ACTION_SPECS:
+        if gesture not in GESTURE_HOLD_GESTURES:
             self.reset()
             return -1
 
