@@ -24,6 +24,12 @@ from paths import setup_paths  # noqa: E402
 
 setup_paths(tracking=True)
 
+from gesture_actions import GESTURE_FOLLOW, GESTURE_FOLLOW_LOST_SEC, GestureFiveLostWatch
+from handoff import (
+    exec_gesture_recognition,
+    log_return_to_gesture,
+    release_before_gesture_return,
+)
 from ros_setup import require_sim2real_msg
 from hand_perception import DIST_MAX_M, DIST_MIN_M, ZedHandTracker
 from ros_control import (
@@ -35,7 +41,6 @@ from ros_control import (
 require_sim2real_msg()
 
 CMD_VEL_TOPIC = "/cmd_vel"
-GESTURE_FOLLOW = 5
 TARGET_DISTANCE_M = 0.50
 DIST_DEADBAND_M = 0.10
 LATERAL_DEADBAND_NORM = 0.20
@@ -189,9 +194,12 @@ def main():
     rospy.loginfo("[htrack] 手柄仲裁: %s", joy_hint)
     print(
         "[htrack] 手掌入画即左右居中；手势5另做前后距离；"
+        f"跟手中 {GESTURE_FOLLOW_LOST_SEC:.0f}s 无五指 → 手势识别；"
         f"手柄={joy_hint}；ESC退出",
         flush=True,
     )
+    g5_watch = GestureFiveLostWatch(lost_sec=GESTURE_FOLLOW_LOST_SEC)
+    return_to_gesture = False
     if args.gui:
         import cv2
 
@@ -218,6 +226,18 @@ def main():
             boot_state.update(has_palm)
             engaged = boot_state.mode == PalmBootState.FOLLOW
             dist_follow = engaged and obs.gesture == GESTURE_FOLLOW
+            is_gesture_five = (
+                obs.has_hand
+                and obs.in_range
+                and obs.gesture == GESTURE_FOLLOW
+            )
+            if g5_watch.should_return_to_gesture(
+                engaged=engaged,
+                is_gesture_five=is_gesture_five,
+            ):
+                log_return_to_gesture(lost_sec=GESTURE_FOLLOW_LOST_SEC)
+                return_to_gesture = True
+                break
 
             joy_blocking = (
                 joy is not None and joy.blocks_hand_tracking()
@@ -263,10 +283,17 @@ def main():
                 joy_left = (
                     joy.idle_remaining() if joy_blocking and joy is not None else 0.0
                 )
+                g5_left = (
+                    max(0.0, GESTURE_FOLLOW_LOST_SEC - g5_watch.lost_elapsed())
+                    if engaged and not is_gesture_five
+                    else 0.0
+                )
                 tip = (
                     f"[htrack] g={obs.gesture} dx={dx_norm:+.2f} z={dist_z:.2f}m "
                     f"cmd_x={cmd_x:+.2f} cmd_z={cmd_z:+.2f} mode={mode}"
                 )
+                if engaged and g5_left > 0:
+                    tip += f" g5_back={g5_left:.1f}s"
                 if joy_blocking:
                     tip += f" joy_wait={joy_left:.1f}s"
                 print(f"\r{tip:100s}", end="", flush=True)
@@ -313,6 +340,15 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if return_to_gesture and not args.dry_run:
+            release_before_gesture_return(
+                tracker=tracker,
+                pub=pub,
+                last_pub_active=last_pub_active,
+                dry_run=args.dry_run,
+                no_gui=not args.gui,
+            )
+            exec_gesture_recognition()
         if not args.dry_run and last_pub_active:
             publish_stop_once(pub)
         tracker.close()

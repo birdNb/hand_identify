@@ -11,7 +11,7 @@ source "${ROOT}/common/ros_env.sh"
 
 cd "${SCRIPT_DIR}"
 echo "[gesture_recognition] 目录: ${SCRIPT_DIR}"
-echo "[gesture_recognition] 脸跟踪常开(locate_face) | 手势 0急停 1撒娇 2抬手 3挥双手 4踢球"
+echo "[gesture_recognition] 脸跟踪常开 | 手势 0急停 1撒娇 2~4动作 5→手部跟踪(无GUI)"
 echo "[gesture_recognition] ESC 退出窗口 | Ctrl+C 强制退出终端"
 echo "[gesture_recognition] 仅预览请加参数: --preview"
 

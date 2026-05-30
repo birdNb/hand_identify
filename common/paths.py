@@ -27,6 +27,7 @@ def setup_paths(
         entries.append(os.path.join(root, "gesture_recognition", "motion"))
     if tracking:
         entries.append(os.path.join(root, "hand_tracking"))
+        entries.append(os.path.join(root, "gesture_recognition"))
     for p in entries:
         if p not in sys.path:
             sys.path.insert(0, p)

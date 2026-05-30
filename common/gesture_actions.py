@@ -9,6 +9,10 @@ GESTURE_STOP = 0
 GESTURE_HEAD_NOD = 1
 GESTURE_FACE_TRACK = GESTURE_HEAD_NOD  # 兼容旧名
 GESTURE_FOLLOW = 5
+GESTURE_FOLLOW_LABEL = "五指跟手(切换手部跟踪)"
+# 手势5 进入/退出跟手模式的稳定时长（秒）
+GESTURE_FOLLOW_HOLD_SEC = 8.0
+GESTURE_FOLLOW_LOST_SEC = 8.0
 GESTURE_ZERO_EXIT_SEC = 5.0
 GESTURE_ZERO_LABEL = "急停/退出"
 GESTURE_HEAD_NOD_LABEL = "撒娇扭腰"
@@ -65,7 +69,7 @@ def action_hint_for_gesture(gesture: int, *, face_track_on: bool = False) -> str
         spec = GESTURE_ACTION_SPECS[gesture]
         return f"动作:{GESTURE_ACTION_LABELS[gesture]}({spec[0]})"
     if gesture == GESTURE_FOLLOW:
-        return "跟手(已禁用)"
+        return GESTURE_FOLLOW_LABEL
     return ""
 
 
@@ -190,15 +194,21 @@ class ConfirmedActionGate:
 
 
 class GestureActionHold:
-    """手势 1~4 需连续稳定 hold_sec 后才输出，供动作库触发。"""
+    """指定手势需连续稳定 hold_sec 后才输出（默认 1~4 动作，可仅 5 跟手切换）。"""
 
     def __init__(
         self,
         hold_sec: float = GESTURE_ACTION_HOLD_SEC,
         lost_grace_sec: float = HAND_LOST_GRACE_SEC,
+        allowed_gestures: Optional[frozenset] = None,
     ):
         self.hold_sec = max(0.1, float(hold_sec))
         self._lost_grace = max(0.0, float(lost_grace_sec))
+        self._allowed = (
+            allowed_gestures
+            if allowed_gestures is not None
+            else GESTURE_HOLD_GESTURES
+        )
         self._candidate = -1
         self._since = 0.0
         self._lost_since: Optional[float] = None
@@ -249,7 +259,7 @@ class GestureActionHold:
         if self._tracking_lost(has_hand, in_range, now):
             self.reset()
             return -1
-        if gesture not in GESTURE_HOLD_GESTURES:
+        if gesture not in self._allowed:
             self.reset()
             return -1
 
@@ -318,6 +328,39 @@ def log_gesture_zero_estop(*, dry_run: bool = False) -> None:
         print(f"\n{Fore.CYAN}[{time.strftime('%H:%M:%S')}] {Fore.RED}{line}", flush=True)
     except ImportError:
         print(f"\n[{time.strftime('%H:%M:%S')}] {line}", flush=True)
+
+
+class GestureFiveLostWatch:
+    """手部跟踪中：连续无手势5 超过 lost_sec 则请求退回手势识别。"""
+
+    def __init__(self, lost_sec: float = GESTURE_FOLLOW_LOST_SEC):
+        self.lost_sec = max(0.1, float(lost_sec))
+        self._lost_since: Optional[float] = None
+
+    def reset(self) -> None:
+        self._lost_since = None
+
+    def should_return_to_gesture(
+        self,
+        *,
+        engaged: bool,
+        is_gesture_five: bool,
+    ) -> bool:
+        if not engaged:
+            self.reset()
+            return False
+        now = time.time()
+        if is_gesture_five:
+            self._lost_since = None
+            return False
+        if self._lost_since is None:
+            self._lost_since = now
+        return (now - self._lost_since) >= self.lost_sec
+
+    def lost_elapsed(self) -> float:
+        if self._lost_since is None:
+            return 0.0
+        return time.time() - self._lost_since
 
 
 def log_gesture_zero_exit(hold_sec: float) -> None:

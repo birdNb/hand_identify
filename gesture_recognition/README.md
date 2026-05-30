@@ -1,6 +1,6 @@
 # gesture_recognition — 手势识别与动作
 
-ZED + MediaPipe 识别手势 **0~5**、手掌 3D 位置与移动方向；**脸部跟踪**与 `locate_face/locate_face.py` 同控制律（共用相机 RGB，常开）；手势 **1~4** 稳定 2s 后触发机器人动作（手势 1 仅扭腰，不抢脖子）。
+ZED + MediaPipe 识别手势 **0~5**、手掌 3D 位置与移动方向；**脸部跟踪**常开（手势 **5** 确认后自动关闭）；手势 **1~4** 稳定 2s 后触发机器人动作；手势 **5** 稳定 **8s** 后切换 `start_hand_tracking.sh`；跟手中 **8s** 无五指则切回本程序。
 
 ## 一键启动
 
@@ -47,5 +47,6 @@ chmod +x start.sh
 | `gesture_motion.py` | ROS 动作调度 |
 | `motion/hand_action_library.py` | 手势 2~4 → `/joy_msg` |
 | `motion/waist_coquette_*.py` | 手势 1 撒娇扭腰（匀速连续、端点不停） |
+| `handoff.py` | 手势 5 → `start_hand_tracking.sh` |
 
 公共模块见 `../common/`。

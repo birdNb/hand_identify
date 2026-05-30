@@ -39,6 +39,8 @@ from colorama import Fore, Style, init
 
 from gesture_actions import (
     GESTURE_ACTION_HOLD_SEC,
+    GESTURE_FOLLOW,
+    GESTURE_FOLLOW_HOLD_SEC,
     GESTURE_STOP,
     GESTURE_ZERO_EXIT_SEC,
     GESTURE_ZERO_LABEL,
@@ -50,6 +52,7 @@ from gesture_actions import (
     log_gesture_zero_estop,
     log_gesture_zero_exit,
 )
+from handoff import exec_hand_tracking, log_follow_handoff, release_before_handoff
 from shutdown import install_handlers, is_requested, request, rospy_shutdown_if_init
 
 init(autoreset=True)
@@ -536,14 +539,18 @@ def main():
         and not args.no_gui
     )
     face_hint = "关" if args.no_face_track else "常开(共用ZED)"
-    action_desc = "关" if args.no_actions else "1撒娇扭腰 2抬手 3挥双手 4踢球"
+    action_desc = (
+        "关"
+        if args.no_actions
+        else "1撒娇扭腰 2抬手 3挥双手 4踢球 5→跟手"
+    )
     mode_desc = "预览" if args.preview or args.no_actions else "执行"
     disp_hint = "640p轻量" if use_lite_display else "1080p全分辨率"
     print(
         Fore.GREEN
         + f"显示: {disp_hint} | 脸部跟踪: {face_hint} | 手势动作[{mode_desc}]: 0急停/按住"
         f"{args.zero_exit_sec:.0f}s退出 "
-        + f"{action_desc}; 稳定{args.gesture_hold_sec:.0f}s后触发",
+        + f"{action_desc}; 1~4稳{args.gesture_hold_sec:.0f}s 5稳{GESTURE_FOLLOW_HOLD_SEC:.0f}s→跟手",
     )
 
     last_logged_gesture = -1
@@ -551,12 +558,19 @@ def main():
     last_log_t = 0.0
     zero_handler = GestureZeroHandler(exit_hold_sec=args.zero_exit_sec)
     action_hold = GestureActionHold(hold_sec=args.gesture_hold_sec)
+    follow_hold = GestureActionHold(
+        hold_sec=GESTURE_FOLLOW_HOLD_SEC,
+        allowed_gestures=frozenset({GESTURE_FOLLOW}),
+    )
+    handoff_requested = False
     frame_idx = 0
     had_hand_prev = False
     draw_landmarks = DRAW_LANDMARKS and not args.no_gui
 
     try:
         while not is_requested():
+            confirmed = -1
+            follow_confirmed = -1
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 if is_requested():
                     break
@@ -591,16 +605,6 @@ def main():
             rgb_mp.flags.writeable = False
 
             results = hands.process(rgb_mp)
-
-            run_face = (
-                face_track is not None
-                and face_track.is_active
-                and (frame_idx % FACE_EVERY_N == 0)
-            )
-            if run_face:
-                face_track.process_shared_rgb(
-                    rgb_mp, display_bgr, proc_w, proc_h,
-                )
 
             gesture = -1
             raw_gesture = -1
@@ -693,6 +697,22 @@ def main():
                 direction = "无手"
 
             has_hand = bool(results.multi_hand_landmarks)
+
+            face_paused_for_follow = (
+                gesture == GESTURE_FOLLOW
+                or follow_hold.pending_gesture == GESTURE_FOLLOW
+            )
+            run_face = (
+                face_track is not None
+                and face_track.is_active
+                and not face_paused_for_follow
+                and (frame_idx % FACE_EVERY_N == 0)
+            )
+            if run_face:
+                face_track.process_shared_rgb(
+                    rgb_mp, display_bgr, proc_w, proc_h,
+                )
+
             zero_estop, zero_exit, zero_hold = zero_handler.update(
                 gesture, has_hand=has_hand, in_range=in_range,
             )
@@ -718,6 +738,15 @@ def main():
                     display_bgr,
                     f"G0 {GESTURE_ZERO_LABEL} exit {remain:.1f}s",
                     (10, 130), (0, 0, 255), font_scale=0.9, thickness=2,
+                )
+            elif face_paused_for_follow:
+                draw_overlay_log(
+                    display_bgr,
+                    "FACE off (G5跟手)",
+                    (10, 130),
+                    (0, 165, 255),
+                    font_scale=0.75,
+                    thickness=2,
                 )
             elif face_track is not None and face_track.is_active:
                 ov = face_track.overlay
@@ -759,16 +788,27 @@ def main():
 
             if gesture == GESTURE_STOP:
                 action_hold.reset()
+                follow_hold.reset()
                 if motion is not None:
                     motion.clear_pending_fire()
                 confirmed = -1
+                follow_confirmed = -1
             else:
                 confirmed = action_hold.update(
+                    gesture, has_hand=has_hand, in_range=in_range,
+                )
+                follow_confirmed = follow_hold.update(
                     gesture, has_hand=has_hand, in_range=in_range,
                 )
 
             if confirmed < 0 and motion is not None:
                 motion.clear_pending_fire()
+
+            if follow_confirmed == GESTURE_FOLLOW:
+                log_follow_handoff(preview=args.preview or args.no_actions)
+                if not args.preview and not args.no_actions:
+                    handoff_requested = True
+                break
 
             if confirmed >= 0:
                 if motion is not None:
@@ -808,6 +848,15 @@ def main():
                         f"{Fore.CYAN}[{time.strftime('%H:%M:%S')}] "
                         f"{Fore.WHITE}手势{gesture}确认中{hold_pct}",
                     )
+                elif (
+                    follow_hold.pending_gesture == GESTURE_FOLLOW
+                    and follow_hold.progress > 0
+                ):
+                    fp = follow_hold.progress * 100
+                    emit_status_line(
+                        f"{Fore.CYAN}[{time.strftime('%H:%M:%S')}] "
+                        f"{Fore.WHITE}手势5→跟手 稳{fp:.0f}%",
+                    )
 
             frame_idx += 1
 
@@ -831,6 +880,15 @@ def main():
 
     finally:
         fast_exit = is_requested()
+        if handoff_requested and not args.preview and not args.no_actions:
+            release_before_handoff(
+                face_track=face_track,
+                motion=motion,
+                zed=zed,
+                hands=hands,
+                no_gui=args.no_gui,
+            )
+            exec_hand_tracking()
         if face_track is not None:
             try:
                 face_track.shutdown()
