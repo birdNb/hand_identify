@@ -1,2 +1,0 @@
--r ../requirements.txt
-# ROS 消息包由 catkin/colcon 工作空间提供, 运行前请 source 机器人工作空间

@@ -1,71 +1,67 @@
-# hand_identify — ZED Mini 手势与 3D 跟踪
+# hand_identify — ZED Mini 手部感知
 
-## 功能
+两大功能模块，共用 `common/` 下的手势定义与 ROS 工具。
 
-- MediaPipe Hands 检测单手 21 关键点
-- 手势数字识别 **0~5**（伸直手指数）
-- ZED 深度/点云计算手掌中心 **3D 坐标**（米）
-- 帧间位移判断移动方向：**前/后/左/右/上/下**
-- OpenCV 画面叠加 + 终端彩色日志
+## 目录结构
+
+```
+hand_identify/
+├── start_gesture_recognition.sh   # 根目录快捷启动 → 手势识别
+├── start_hand_tracking.sh         # 根目录快捷启动 → 手部跟踪
+├── requirements.txt
+├── common/                        # 公共
+│   ├── gesture_actions.py         # 手势 0~5 定义、稳定判定
+│   ├── ros_setup.py               # sim2real Python 路径
+│   ├── ros_control.py             # FSM / 手柄仲裁
+│   ├── paths.py                   # 模块路径
+│   └── ros_env.sh                 # source ROS 环境
+├── gesture_recognition/           # 手势识别 + 脸跟踪 + 动作
+│   ├── start.sh
+│   ├── zed_gesture_recognition.py
+│   ├── face_tracker.py            # locate_face 同律，共用 ZED
+│   ├── gesture_motion.py
+│   └── motion/                    # /joy_msg、撒娇扭腰
+└── hand_tracking/                 # 手部跟踪（底盘跟手）
+    ├── start.sh
+    ├── hand_perception.py         # ZED 感知库
+    ├── distance_hold.py           # 左右居中 + 手势5 距离保持
+    └── locomotion.py              # 全轴跟手备份
+```
 
 ## 依赖
 
-1. 安装 [ZED SDK](https://www.stereolabs.com/developers/release/)（建议 4.2+）
-2. Python 包：
-
 ```bash
 pip install -r requirements.txt
-# ZED SDK 安装后:
-pip install pyzed
+pip install pyzed   # 安装 ZED SDK 后
 ```
 
-## 子工程 hand_follow（手势 5 跟手）
+## 一键启动
 
-手势 **5** 时底盘跟随手部距离与横向位置，输出 `/cmd_vel`。详见 [hand_follow/README.md](hand_follow/README.md)。
+### 手势识别（0~5 + 脸跟踪 + 动作 1~4）
 
 ```bash
-cd hand_identify/hand_follow
-python3 hand_follow_robot.py              # 调试
-python3 hand_follow_robot.py --enable-motion
+cd ~/Bird_ws/hand_identify
+./start_gesture_recognition.sh
 ```
 
-## 运行（仅识别）
+仅识别、不控机器人：`./start_gesture_recognition.sh --preview`
+
+详见 [gesture_recognition/README.md](gesture_recognition/README.md)
+
+### 手部跟踪（左右居中 + 手势 5 距离）
 
 ```bash
-cd hand_identify
-python3 zed_gesture_recognition.py
+cd ~/Bird_ws/hand_identify
+./start_hand_tracking.sh
 ```
 
-无界面（仅终端日志）：
+详见 [hand_tracking/README.md](hand_tracking/README.md)
 
-```bash
-python3 zed_gesture_recognition.py --no-gui
-```
+## 手势一览
 
-按 **ESC** 退出，**f** 切换全屏（默认自动全屏）。
-
-## 分辨率 (对齐 locate_face)
-
-- 默认 **ZED SDK HD1080**（1920×1080 @ 30fps），比 HD720 更清晰
-- 显示与深度/点云用**全分辨率**；MediaPipe 输入缩至 **960px 宽**（与 `locate_face` 的 `PROC_MAX_W` 一致）
-- 若性能不足: `--hd720` 或 `--proc-max-w 720`
-
-## 参数
-
-| 参数 | 说明 |
-|------|------|
-| `--no-gui` | 不弹窗 |
-| `--move-threshold 0.03` | 移动判定阈值(米)，默认 0.02 |
-| `--hd720` | 降为 HD720 采集 |
-| `--proc-max-w 960` | MediaPipe 最大输入宽度 |
-| `--dist-min 0.2` | 最近识别距离(米) |
-| `--dist-max 2.0` | 最远识别距离(米) |
-
-## 调试
-
-- 深度不准：在脚本里把 `DEPTH_MODE.QUALITY` 改为 `ULTRA`
-- 手势不稳：提高 `min_detection_confidence`（默认 0.7）；或调大 `THUMB_EXTEND_MIN`（减少拇指误计）
-- 1 被识别成 2：拇指误检，可调 `THUMB_EXTEND_MIN`
-- 5 被识别成 3/4：无名指/小指漏检，已改「指尖-手腕距离」判定 + 小指略放宽
-- 方向太敏感：增大 `--move-threshold`
-- 识别距离：默认 **0.2~2.0m**（Z 深度），超出范围只显示骨架、不计手势
+| 手势 | 手势识别 | 手部跟踪 |
+|------|----------|----------|
+| 0 | 急停 / 按住 5s 退出 | — |
+| 1 | 撒娇扭腰 | — |
+| 2~4 | 抬手 / 挥双手 / 踢球 | — |
+| 5 | 识别显示 | 左右转 + 手势5 前后距离 → `/cmd_vel` |
